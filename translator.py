@@ -35,6 +35,7 @@ import collections
 import configparser
 
 APP_NAME = "Kat"
+APP_VERSION = "1.0.0"  # менять при каждом обновлении + запись в CHANGELOG.md
 OLD_APP_NAMES = ("Голосовой переводчик",)  # прежние названия — их ярлыки заменяем новыми
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.abspath(__file__)
@@ -106,7 +107,7 @@ class Log:
 
 def setup_logging():
     sys.stdout = sys.stderr = Log(LOG_FILE, sys.__stdout__)
-    print(f"===== Запуск {time.strftime('%Y-%m-%d %H:%M:%S')} =====")
+    print(f"===== Запуск {APP_NAME} {APP_VERSION}, {time.strftime('%Y-%m-%d %H:%M:%S')} =====")
 
     def excepthook(exc_type, exc, tb):
         traceback.print_exception(exc_type, exc, tb)
@@ -1449,7 +1450,7 @@ class SettingsWindow:
         self.app = app
         self.saved_visual = {k: globals()[k] for k in self.VISUAL}
         self.win = win = tk.Toplevel(app.root)
-        win.title(f"Настройки — {APP_NAME}")
+        win.title(f"Настройки — {APP_NAME} {APP_VERSION}")
         win.resizable(False, False)
         win.attributes("-topmost", True)  # не прятаться за игрой и оверлеем
         try:
