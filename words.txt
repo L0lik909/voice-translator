@@ -1,0 +1,123 @@
+# Подсказки для распознавания речи (Whisper hotwords).
+# Слова отсюда помогают Whisper правильно писать имена героев и сленг.
+#
+# Как заполнять:
+#   - одно слово или фраза на строку; строки с # — комментарии;
+#   - [ru] — подсказки для моей речи (как слово пишется по-русски);
+#   - [en] — подсказки для речи собеседников (как слово пишется
+#     по-английски);
+#   - ВАЖНО: у Whisper лимит ~220 токенов на подсказку (это примерно
+#     60–80 английских слов или 35–50 русских). Всё, что не влезло,
+#     отбрасывается С КОНЦА списка — поэтому самое нужное ставьте наверх.
+#     Сколько слов вошло, программа пишет в консоль.
+#   - Не добавляйте всё подряд: длинный список «размывает» подсказку,
+#     а на шуме Whisper может начать выдумывать слова из неё.
+#     Держите здесь то, что реально встречается в ваших играх.
+#   - Файл перечитывается автоматически, перезапуск не нужен.
+
+[ru]
+# --- Dota 2 ---
+Пудж
+Инвокер
+Антимаг
+Фантомка
+Джагернаут
+Сфа
+Квопа
+Войд
+Рубик
+Тинкер
+Шейкер
+Рошан
+Аегис
+Аганим
+БКБ
+Блинк
+вард
+смок
+ганк
+мидер
+керри
+саппорт
+байбэк
+# --- Genshin Impact ---
+Райдэн
+Чжун Ли
+Нахида
+Фурина
+Нёвиллет
+Ху Тао
+Кадзуха
+Сяо
+Гань Юй
+Аяка
+Е Лань
+Синцю
+Сян Лин
+Беннет
+Венти
+Паймон
+Мавуика
+Тейват
+примогемы
+крутка
+гарант
+бездна
+
+[en]
+# --- Dota 2 ---
+Pudge
+Invoker
+Anti-Mage
+Phantom Assassin
+Juggernaut
+Shadow Fiend
+Queen of Pain
+Faceless Void
+Rubick
+Tinker
+Earthshaker
+Templar Assassin
+Storm Spirit
+Ember Spirit
+Techies
+Terrorblade
+Spectre
+Morphling
+Slark
+Roshan
+Aegis
+Aghanim's
+BKB
+Blink Dagger
+ward
+deward
+smoke
+gank
+mid
+carry
+buyback
+rax
+# --- Genshin Impact ---
+Raiden Shogun
+Zhongli
+Nahida
+Furina
+Neuvillette
+Hu Tao
+Kazuha
+Xiao
+Ganyu
+Ayaka
+Yelan
+Xingqiu
+Xiangling
+Bennett
+Venti
+Paimon
+Mavuika
+Arlecchino
+Teyvat
+primogems
+Spiral Abyss
+pity

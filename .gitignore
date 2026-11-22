@@ -1,0 +1,19 @@
+# Окружение и модели — создаются/скачиваются при установке (start.bat)
+venv/
+models/
+__pycache__/
+*.pyc
+
+# Личное: настройки устройств, лог разговоров, запись голоса
+settings.ini
+settings.ini.tmp
+log.txt
+log.old.txt
+last.wav
+
+# Иконка рисуется программой сама
+icon-*.ico
+
+# Временное
+_battest/
+*.zip

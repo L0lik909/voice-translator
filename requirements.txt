@@ -1,0 +1,10 @@
+faster-whisper
+sounddevice
+numpy
+keyboard
+sentencepiece
+PyAudioWPatch
+nvidia-cublas-cu12
+nvidia-cudnn-cu12==9.*
+pystray
+Pillow
