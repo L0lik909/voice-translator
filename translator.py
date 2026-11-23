@@ -6,7 +6,7 @@ F9  (держать): говоришь по-русски -> внизу экра�
 F10 (нажать):  переводит на русский то, что собеседники сказали за последние
                ~10 секунд (звук из наушников/колонок) -> вверху экрана.
 F11 (нажать):  живой перевод вкл/выкл: Kat сам слушает собеседников и
-               показывает перевод каждой фразы, как субтитры.
+               переводит их прямо по ходу речи, как субтитры.
 
 Управление — иконка в трее: Настройки / Пауза / Перезапустить / Открыть папку / Выход.
 Выход также по Ctrl+Shift+F9. Всё, что программа сообщает, пишется в log.txt.
@@ -35,13 +35,13 @@ import collections
 import configparser
 
 APP_NAME = "Kat"
-APP_VERSION = "1.0.0"  # менять при каждом обновлении + запись в CHANGELOG.md
+APP_VERSION = "1.1.0"  # менять при каждом обновлении + запись в CHANGELOG.md
 OLD_APP_NAMES = ("Голосовой переводчик",)  # прежние названия — их ярлыки заменяем новыми
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.abspath(__file__)
 SETTINGS_FILE = os.path.join(BASE_DIR, "settings.ini")
 LOG_FILE = os.path.join(BASE_DIR, "log.txt")
-ICON_VERSION = 2  # увеличить, когда меняется рисунок в draw_icon
+ICON_VERSION = 3  # увеличить, когда меняется рисунок в draw_icon
 # Версия в имени файла: Windows кэширует иконки по пути, и при том же имени
 # ярлыки продолжали бы показывать старую картинку.
 ICON_FILE = os.path.join(BASE_DIR, f"icon-v{ICON_VERSION}.ico")
@@ -49,6 +49,7 @@ PYTHONW = os.path.join(BASE_DIR, "venv", "Scripts", "pythonw.exe")
 REQUIREMENTS = os.path.join(BASE_DIR, "requirements.txt")
 REQ_STAMP = os.path.join(BASE_DIR, "venv", "requirements.sha256")  # пишет start.bat
 SAMPLE_RATE = 16000  # Whisper работает только с 16 кГц — не настройка
+GITHUB_REPO = "L0lik909/voice-translator"  # отсюда проверяются обновления (релизы)
 
 
 # ======================= ЛОГ =======================
@@ -179,8 +180,8 @@ hotkey = f10
 ; Сколько последних секунд звука переводить.
 seconds = 10
 
-; Живой перевод: Kat сам слушает собеседников и переводит каждую фразу,
-; как только она закончилась (без нажатия клавиши). Русскую речь пропускает.
+; Живой перевод: Kat сам слушает собеседников и переводит их прямо по ходу
+; речи (без нажатия клавиши), как субтитры. Русскую речь пропускает.
 ; Клавиша включения/выключения (одна клавиша, без сочетаний):
 live_hotkey = f11
 ; Включён ли живой перевод (да / нет). Запоминается при переключении.
@@ -231,6 +232,9 @@ min_seconds = 0.3
 ; При каждом запуске Windows будет спрашивать разрешение (окно UAC).
 ; Автозапуск вместе с Windows включается в окне «Настройки».
 run_as_admin = нет
+
+; При запуске проверять, не вышла ли новая версия Kat на GitHub (да / нет).
+check_updates = да
 """
 
 # Какая строка settings.ini в какую переменную программы попадает:
@@ -261,6 +265,7 @@ SPEC = [
     ("THEM_Y_FROM_TOP", "внешний_вид", "them_y_from_top", "int"),
     ("MIN_SECONDS", "внешний_вид", "min_seconds", "float"),
     ("RUN_AS_ADMIN", "запуск", "run_as_admin", "bool"),
+    ("CHECK_UPDATES", "запуск", "check_updates", "bool"),
 ]
 
 
@@ -1131,66 +1136,64 @@ class Overlay:
 # ======================= ТРЕЙ =======================
 
 def draw_icon(size, paused=False):
-    """Иконка программы: скруглённый квадрат с градиентом и два облачка-реплики
-    («A» и «Я»): разговор на двух языках. Рисуется в 4 раза крупнее и уменьшается —
-    так края получаются гладкими. До 24 px — без букв: они там нечитаемы.
-    paused=True — серый вариант для трея на паузе.
+    """Иконка программы в стиле логотипа Kat: тёмный скруглённый квадрат, белый
+    контур кошачьей головы с фиолетовыми ушками и буква «K». Рисуется в 4 раза
+    крупнее и уменьшается — так края гладкие. paused=True — серая (пауза в трее).
     """
-    from PIL import Image, ImageDraw, ImageFont, ImageFilter
+    from PIL import Image, ImageDraw, ImageFont
     S = size * 4
     u = S / 100  # одна сотая стороны
 
-    # --- фон: диагональный градиент синий -> фиолетовый в скруглённом квадрате ---
-    top, bottom = ((150, 150, 150), (95, 95, 95)) if paused else ((64, 140, 255), (124, 77, 255))
+    def P(points):
+        return [(x * u, y * u) for x, y in points]
+
+    def curve(p0, p1, p2, n=12):  # квадратичная кривая Безье
+        return [((1 - t) ** 2 * p0[0] + 2 * (1 - t) * t * p1[0] + t * t * p2[0],
+                 (1 - t) ** 2 * p0[1] + 2 * (1 - t) * t * p1[1] + t * t * p2[1])
+                for t in (i / n for i in range(n + 1))]
+
+    purple = (150, 150, 150, 255) if paused else (139, 92, 246, 255)
+    white = (225, 225, 225, 255) if paused else (244, 238, 255, 255)
+    top, bottom = ((40, 40, 44), (18, 18, 20)) if paused else ((34, 22, 58), (11, 8, 20))
+
+    # --- фон: тёмный градиент сверху вниз в скруглённом квадрате ---
     grad = Image.new("RGBA", (S, S))
     gd = ImageDraw.Draw(grad)
-    for i in range(2 * S):  # диагональные полосы
-        t = i / (2 * S - 1)
-        c = tuple(round(a + (b - a) * t) for a, b in zip(top, bottom))
-        gd.line([(i, 0), (0, i)], fill=c + (255,), width=2)
+    for y in range(S):
+        t = y / (S - 1)
+        gd.line([(0, y), (S, y)], fill=tuple(round(a + (b - a) * t) for a, b in zip(top, bottom)) + (255,))
     mask = Image.new("L", (S, S), 0)
     ImageDraw.Draw(mask).rounded_rectangle((2 * u, 2 * u, 98 * u, 98 * u), radius=22 * u, fill=255)
     img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
     img.paste(grad, (0, 0), mask)
-    # лёгкий блик сверху
-    gloss = Image.new("L", (S, S), 0)
-    ImageDraw.Draw(gloss).ellipse((-20 * u, -60 * u, 120 * u, 45 * u), fill=40)
-    white = Image.new("RGBA", (S, S), (255, 255, 255, 255))
-    img.paste(white, (0, 0), Image.composite(gloss, Image.new("L", (S, S), 0), mask))
+    d = ImageDraw.Draw(img)
 
-    def bubble(box, tail, fill):
-        """Облачко: скруглённый прямоугольник + хвостик (треугольник)."""
-        layer = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-        d = ImageDraw.Draw(layer)
-        d.rounded_rectangle([v * u for v in box], radius=12 * u, fill=fill)
-        d.polygon([(x * u, y * u) for x, y in tail], fill=fill)
-        return layer
+    # --- кошачья голова: фиолетовые ушки + белый контур ---
+    left = (curve((15, 50), (14, 24), (21, 13)) + curve((21, 13), (24, 10), (28, 13))
+            + curve((28, 13), (38, 20), (43, 27)))
+    head = curve((43, 27), (50, 24), (57, 27))
+    right = [(100 - x, y) for x, y in reversed(left)]
+    outline = left + head[1:] + right[1:]
+    d.polygon(P(curve((24, 22), (25, 34), (27, 42)) + [(40, 31)]), fill=purple)
+    d.polygon(P(curve((76, 22), (75, 34), (73, 42)) + [(60, 31)]), fill=purple)
+    d.line(P(outline), fill=white, width=round(6.5 * u), joint="curve")
+    r = 3.25 * u  # скруглённые концы линии
+    for x, y in (outline[0], outline[-1]):
+        d.ellipse((x * u - r, y * u - r, x * u + r, y * u + r), fill=white)
 
-    def shadow(layer):
-        a = layer.split()[3].point(lambda v: v * 0.35)
-        sh = Image.new("RGBA", (S, S), (20, 10, 60, 255))
-        sh.putalpha(a)
-        sh = sh.filter(ImageFilter.GaussianBlur(3 * u))
-        out = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-        out.paste(sh, (0, round(2.5 * u)))
-        return out
-
-    accent = (200, 200, 200, 255) if paused else (255, 202, 40, 255)  # жёлтое облачко
-    back = bubble((12, 16, 62, 56), [(20, 52), (18, 68), (34, 54)], (255, 255, 255, 255))
-    front = bubble((38, 42, 88, 82), [(80, 78), (82, 94), (66, 80)], accent)
-    for layer in (shadow(back), back, shadow(front), front):
-        img.alpha_composite(layer)
-
-    if size >= 32:
+    # --- буква K ---
+    font = None
+    for name in ("seguibl.ttf", "segoeuib.ttf", "arialbd.ttf"):
         try:
-            font = ImageFont.truetype("segoeuib.ttf", round(30 * u))
+            font = ImageFont.truetype(name, round(54 * u))
+            break
         except OSError:
-            font = ImageFont.load_default()
-        d = ImageDraw.Draw(img)
-        d.text((37 * u, 36 * u), "A", font=font, anchor="mm",
-               fill=(110, 110, 110) if paused else (70, 95, 255))
-        d.text((63 * u, 62 * u), "Я", font=font, anchor="mm",
-               fill=(60, 60, 60) if paused else (90, 50, 0))
+            pass
+    d.text((50 * u, 64 * u), "K", font=font or ImageFont.load_default(), anchor="mm", fill=white)
+
+    # --- фиолетовая дуга снизу: на мелких размерах только мешает ---
+    if size >= 32:
+        d.arc((12 * u, 28 * u, 88 * u, 93 * u), 30, 150, fill=purple, width=round(5 * u))
 
     return img.resize((size, size), Image.LANCZOS)
 
@@ -1416,6 +1419,31 @@ def set_autostart(on):
     print("[автозапуск] выключен")
 
 
+# ======================= ОБНОВЛЕНИЯ =======================
+
+def _version_tuple(v):
+    """«v1.2.3» / «1.2» -> (1, 2, 3) / (1, 2, 0) — для сравнения версий."""
+    nums = [int(x) for x in re.findall(r"\d+", v)[:3]]
+    return tuple(nums + [0] * (3 - len(nums)))
+
+
+def check_for_update():
+    """Последний релиз на GitHub. (версия, ссылка, что нового), если он новее этой версии,
+    иначе None. Ошибки сети — исключением (их ловит вызывающий)."""
+    import json
+    import urllib.request
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+        headers={"User-Agent": f"Kat/{APP_VERSION}", "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.load(resp)
+    tag = data.get("tag_name") or ""
+    if not tag or _version_tuple(tag) <= _version_tuple(APP_VERSION):
+        return None
+    url = data.get("html_url") or f"https://github.com/{GITHUB_REPO}/releases/latest"
+    return tag.lstrip("vV"), url, (data.get("body") or "").strip()
+
+
 # ======================= ОКНО НАСТРОЕК =======================
 
 KEY_CHOICES = [f"f{i}" for i in range(1, 13)] + [
@@ -1541,6 +1569,9 @@ class SettingsWindow:
                   text="Нужно, если игра запущена от администратора (например Genshin Impact) —\n"
                        f"иначе F9/F10 внутри игры не срабатывают. ({now})"
                   ).grid(row=2, column=0, sticky="w", padx=(22, 0))
+        self.updates = tk.BooleanVar(value=CHECK_UPDATES)
+        ttk.Checkbutton(box, text="Проверять обновления при запуске", variable=self.updates
+                        ).grid(row=3, column=0, sticky="w", pady=(6, 2))
 
         # --- кнопки ---
         bar = ttk.Frame(frm)
@@ -1705,7 +1736,8 @@ class SettingsWindow:
         want_admin, admin_was = self.admin.get(), RUN_AS_ADMIN
 
         values = {**visual, **{k: globals()[k] for k in old_keys},
-                  "MIC_DEVICE": mic, "LOOPBACK_DEVICE": out, "RUN_AS_ADMIN": want_admin}
+                  "MIC_DEVICE": mic, "LOOPBACK_DEVICE": out, "RUN_AS_ADMIN": want_admin,
+                  "CHECK_UPDATES": self.updates.get()}
         self.show_visual(values)
         self.saved_visual = {k: globals()[k] for k in self.VISUAL}
         app.update_tray()  # в меню трея указана клавиша живого перевода
@@ -1760,6 +1792,8 @@ class App:
         self.live_lines = []  # живой перевод: (время, текст) последних фраз на экране
         self.live_key_down = False  # клавиша живого перевода нажата (защита от автоповтора)
         self.them_hold_until = 0.0  # до этого момента на экране результат F10 — не перекрывать
+        self.live_phrase_lang = None  # язык текущей фразы (определяется один раз на фразу)
+        self.update_info = None  # (версия, ссылка, что нового), если на GitHub есть новее
         self.settings_window = None
         self.tray = None
 
@@ -1847,6 +1881,8 @@ class App:
             if st["live"]:
                 print("[живой] живой перевод включён")
             self.show("me", f"Готово ({desc}). {HOTKEY.upper()} — говорить{them_info}", 5)
+            if CHECK_UPDATES:
+                threading.Thread(target=self.update_checker, daemon=True, name="updates").start()
         except Exception as e:
             traceback.print_exc()
             self.show("me", f"Не удалось загрузить модели: {e}\nПодробности в log.txt", 20)
@@ -1895,7 +1931,7 @@ class App:
             return False
         return True
 
-    def transcribe(self, audio, lang, task):
+    def transcribe(self, audio, lang, task, beam=5):
         model = self.state["model"]
         # подсказки берём на языке результата: при переводе Whisper'ом это английский
         hint_lang = "en" if task == "translate" else lang
@@ -1904,7 +1940,7 @@ class App:
                 # без VAD (речь не найдена) — без подсказок: на шуме Whisper начинает
                 # выдумывать слова из них («Pudge, Pudge...»)
                 hotwords = self.state["hints"].get(hint_lang) if vad else None
-                segs, _ = model.transcribe(audio, language=lang, task=task, beam_size=5,
+                segs, _ = model.transcribe(audio, language=lang, task=task, beam_size=beam,
                                            vad_filter=vad, condition_on_previous_text=False,
                                            hotwords=hotwords)
                 segs = list(segs)
@@ -2051,10 +2087,12 @@ class App:
         threading.Thread(target=self.process_them, daemon=True).start()
 
     # ---------- живой перевод собеседников ----------
-    LIVE_TICK = 0.3          # как часто проверяем, не закончилась ли фраза, с
-    LIVE_END_SILENCE = 0.6   # столько тишины после речи = фраза закончилась, с
-    LIVE_MAX_PHRASE = 9.0    # длиннее — переводим кусок, не дожидаясь паузы, с
+    LIVE_TICK = 0.2          # как часто проверяем звук, с
+    LIVE_END_SILENCE = 0.45  # столько тишины после речи = фраза закончилась, с
+    LIVE_MAX_PHRASE = 12.0   # длиннее — закрываем фразу, не дожидаясь паузы, с
     LIVE_MIN_SPEECH = 0.4    # короче — не речь (щелчки, выстрелы), с
+    LIVE_PARTIAL_START = 0.8  # с такой длины речи показываем перевод по ходу фразы, с
+    LIVE_PARTIAL_EVERY = 0.8  # и обновляем его не чаще, чем раз в столько секунд
 
     def on_live(self, _):
         # пока клавишу держат, Windows повторяет нажатие — переключаем только первое
@@ -2101,6 +2139,7 @@ class App:
         attached, q = None, None
         pending = np.zeros(0, dtype=np.float32)  # ещё не переведённый звук, 16 кГц
         sr = SAMPLE_RATE
+        last_partial = 0.0  # когда показали промежуточный перевод текущей фразы
 
         def detach():
             if attached is not None and q in attached.taps:
@@ -2135,48 +2174,85 @@ class App:
                     pending = pending[-int(0.5 * sr):]  # тишина/шум: держим только хвост
                     continue
                 start, end = speech[0]["start"], speech[-1]["end"]
+                begin = max(0, start - int(0.2 * sr))
                 if len(pending) - end >= self.LIVE_END_SILENCE * sr:
                     cut = end  # фраза закончилась
                 elif len(pending) - start >= self.LIVE_MAX_PHRASE * sr:
-                    cut = len(pending)  # говорят без пауз — переводим что есть
+                    cut = len(pending)  # говорят без пауз — закрываем фразу
                 else:
-                    continue  # фраза ещё идёт
-                phrase = pending[max(0, start - int(0.2 * sr)):cut]
+                    # фраза ещё идёт — показываем перевод того, что уже сказано
+                    # (пауза считается от КОНЦА прошлого черновика: на длинной фразе
+                    # черновик считается ~1 с, и без передышки перевод отстаёт от речи)
+                    if (len(pending) - start >= self.LIVE_PARTIAL_START * sr
+                            and time.monotonic() - last_partial >= self.LIVE_PARTIAL_EVERY):
+                        self.process_live(pending[begin:], final=False)
+                        last_partial = time.monotonic()
+                    continue
+                phrase = pending[begin:cut]
                 pending = pending[cut:]
-                self.process_live(phrase)
+                last_partial = 0.0
+                self.process_live(phrase, final=True)
             except Exception:
                 traceback.print_exc()
                 time.sleep(1)
 
-    def process_live(self, audio):
+    def process_live(self, audio, final=True):
+        """Перевод фразы собеседника. final=False — фраза ещё идёт: быстрый черновой
+        перевод (луч 1), он заменится точным, когда фраза закончится."""
         st = self.state
         audio, peak = self.normalize(audio)
         if peak < 0.005 or len(audio) < self.LIVE_MIN_SPEECH * SAMPLE_RATE:
             return
         t0 = time.perf_counter()
-        lang = "en" if SOURCE_LANG == "en" else self.detect_lang(audio, ("en", SOURCE_LANG))
+        # язык определяем на первом черновике и на всей фразе в конце (так надёжнее)
+        lang = self.live_phrase_lang
+        if SOURCE_LANG == "en":
+            lang = "en"
+        elif final or lang is None:
+            lang = self.detect_lang(audio, ("en", SOURCE_LANG))
+        self.live_phrase_lang = None if final else lang
         if lang != "en":
             # речь уже на моём языке (русскоязычные собеседники) — переводить нечего
-            print(f"[живой] {len(audio) / SAMPLE_RATE:.1f} с, язык {lang} — пропускаю")
+            if final:
+                print(f"[живой] {len(audio) / SAMPLE_RATE:.1f} с, язык {lang} — пропускаю")
+                self.show_live(None, final=True)  # убрать черновик, если он был
             return
-        heard = self.transcribe(audio, "en", "transcribe")
-        if not heard or not st["live"] or st["paused"]:
+        heard = self.transcribe(audio, "en", "transcribe", beam=5 if final else 1)
+        if not st["live"] or st["paused"]:
+            return
+        if not heard:
+            if final:
+                self.show_live(None, final=True)
             return
         t1 = time.perf_counter()
         ru = self.translate(st["mt_en_ru"], heard)
         t2 = time.perf_counter()
-        print(f"[живой] {len(audio) / SAMPLE_RATE:.1f} с, распознавание {t1 - t0:.2f} с"
-              f" + перевод {t2 - t1:.2f} с")
-        print(f"[живой] {heard}")
-        print(f"[живой] {ru}")
-        if st["busy_them"] or time.monotonic() < self.them_hold_until:
+        if final:
+            print(f"[живой] {len(audio) / SAMPLE_RATE:.1f} с, распознавание {t1 - t0:.2f} с"
+                  f" + перевод {t2 - t1:.2f} с")
+            print(f"[живой] {heard}")
+            print(f"[живой] {ru}")
+        text = f"{ru}\n{heard}" if SHOW_ORIGINAL else ru
+        self.show_live(text if final else text + " …", final)
+
+    def show_live(self, text, final):
+        """Субтитры: две последние фразы. Черновик текущей фразы заменяется
+        следующим черновиком или окончательным переводом; text=None — убрать черновик."""
+        if self.state["busy_them"] or time.monotonic() < self.them_hold_until:
             return  # сейчас на экране результат F10 — не перебиваем
-        # как субтитры: две последние фразы, пока предыдущая ещё не исчезла бы с экрана
+        if text is None and all(f for _, _, f in self.live_lines):
+            return  # черновика на экране нет — убирать нечего
         now = time.monotonic()
-        lines = [(t, x) for t, x in self.live_lines if now - t < DISPLAY_SECONDS]
-        self.live_lines = (lines + [(now, f"{ru}\n{heard}" if SHOW_ORIGINAL else ru)])[-2:]
-        text = ("\n\n" if SHOW_ORIGINAL else "\n").join(x for _, x in self.live_lines)
-        self.show("them", text, DISPLAY_SECONDS, THEM_COLOR)
+        lines = [(t, x, f) for t, x, f in self.live_lines if f and now - t < DISPLAY_SECONDS]
+        if text is not None:
+            lines.append((now, text, final))
+        self.live_lines = lines[-2:]
+        if not self.live_lines:
+            if text is None:
+                self.ui_q.put(("hide", "them"))
+            return
+        sep = "\n\n" if SHOW_ORIGINAL else "\n"
+        self.show("them", sep.join(x for _, x, _ in self.live_lines), DISPLAY_SECONDS, THEM_COLOR)
 
     # ---------- смена устройств на ходу (из окна настроек) ----------
     def switch_mic(self, device, problems):
@@ -2210,6 +2286,31 @@ class App:
             old.close()
         return True
 
+    # ---------- обновления ----------
+    def update_checker(self):
+        time.sleep(6)  # пусть сначала погаснет сообщение «Готово»
+        try:
+            info = check_for_update()
+        except Exception as e:
+            print(f"[i] Не удалось проверить обновления: {e}")
+            return
+        if info is None:
+            print(f"[i] Обновлений нет: {APP_NAME} {APP_VERSION} — последняя версия.")
+            return
+        version, url, notes = info
+        self.update_info = info
+        print(f"[обновление] Вышла версия {version} (у вас {APP_VERSION}): {url}")
+        if notes:
+            print("[обновление] Что нового:\n" + notes)
+        self.call_in_ui(self.update_tray)
+        self.show("me", f"Вышла новая версия {APP_NAME} {version}!\n"
+                        "Скачать — в меню иконки в трее", 10)
+
+    def open_update_page(self):
+        import webbrowser
+        if self.update_info is not None:
+            webbrowser.open(self.update_info[1])
+
     # ---------- трей ----------
     def start_tray(self):
         try:
@@ -2219,6 +2320,9 @@ class App:
             return
         item = pystray.MenuItem
         menu = pystray.Menu(
+            item(lambda _: f"⬇ Скачать обновление {self.update_info[0]}" if self.update_info
+                 else "", lambda: self.open_update_page(),
+                 visible=lambda _: self.update_info is not None),
             item("Настройки", lambda: self.call_in_ui(self.open_settings), default=True),
             item(lambda _: f"Живой перевод ({LIVE_HOTKEY.upper()})",
                  lambda: self.call_in_ui(self.toggle_live),
@@ -2228,6 +2332,7 @@ class App:
             item("Перезапустить", lambda: self.call_in_ui(self.restart)),
             item("Открыть папку", lambda: os.startfile(BASE_DIR)),
             pystray.Menu.SEPARATOR,
+            item(f"{APP_NAME} {APP_VERSION}", lambda: None, enabled=False),
             item("Выход", lambda: self.ui_q.put(("quit",))),
         )
         self.tray = pystray.Icon("voice_translator", tray_image(False), self.tray_title(), menu)
@@ -2236,8 +2341,12 @@ class App:
     def tray_title(self):
         st = self.state
         if st["paused"]:
-            return APP_NAME + " — пауза"
-        return APP_NAME + (" — живой перевод" if st["live"] else "")
+            title = APP_NAME + " — пауза"
+        else:
+            title = APP_NAME + (" — живой перевод" if st["live"] else "")
+        if self.update_info is not None:
+            title += f"\nДоступна версия {self.update_info[0]}"
+        return title
 
     def update_tray(self):
         if self.tray is not None:
