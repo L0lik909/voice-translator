@@ -35,7 +35,8 @@ import collections
 import configparser
 
 APP_NAME = "Kat"
-APP_VERSION = "1.3.0"  # менять при каждом обновлении + запись в CHANGELOG.md
+APP_AUTHOR = "L0lik"
+APP_VERSION = "1.3.1"  # менять при каждом обновлении + запись в CHANGELOG.md
 OLD_APP_NAMES = ("Голосовой переводчик",)  # прежние названия — их ярлыки заменяем новыми
 # FROZEN — запущены как Kat.exe из установщика (PyInstaller), а не как translator.py
 FROZEN = bool(getattr(sys, "frozen", False))
@@ -1725,6 +1726,8 @@ class SettingsWindow:
         bar = ttk.Frame(frm)
         bar.grid(row=5, column=0, sticky="ew")
         self.status = ttk.Label(bar, foreground="#2E7D32")
+        ttk.Label(frm, text=f"{APP_NAME} {APP_VERSION} · By {APP_AUTHOR}", foreground="#888"
+                  ).grid(row=6, column=0, sticky="e", pady=(8, 0))
         self.status.pack(side="left")
         ttk.Button(bar, text="Применить", command=lambda: self.apply(False)).pack(side="right")
         ttk.Button(bar, text="Отмена", command=self.cancel).pack(side="right", padx=6)
@@ -2628,7 +2631,7 @@ class App:
             item("Перезапустить", lambda: self.call_in_ui(self.restart)),
             item("Открыть папку", lambda: os.startfile(BASE_DIR)),
             pystray.Menu.SEPARATOR,
-            item(f"{APP_NAME} {APP_VERSION}", lambda: None, enabled=False),
+            item(f"{APP_NAME} {APP_VERSION} · By {APP_AUTHOR}", lambda: None, enabled=False),
             item("Выход", lambda: self.ui_q.put(("quit",))),
         )
         self.tray = pystray.Icon("voice_translator", tray_image(False), self.tray_title(), menu)

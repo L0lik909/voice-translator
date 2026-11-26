@@ -1,4 +1,5 @@
 <p align="center"><img src="assets/logo.png" alt="Kat" width="420"></p>
+<p align="center"><b>By L0lik</b></p>
 
 # Kat — голосовой переводчик для игр
 
