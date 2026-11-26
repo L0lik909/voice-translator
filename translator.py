@@ -37,7 +37,7 @@ import configparser
 
 APP_NAME = "Kat"
 APP_AUTHOR = "L0lik"
-APP_VERSION = "1.4.0"  # менять при каждом обновлении + запись в CHANGELOG.md
+APP_VERSION = "1.5.0"  # менять при каждом обновлении + запись в CHANGELOG.md
 OLD_APP_NAMES = ("Голосовой переводчик",)  # прежние названия — их ярлыки заменяем новыми
 # FROZEN — запущены как Kat.exe из установщика (PyInstaller), а не как translator.py
 FROZEN = bool(getattr(sys, "frozen", False))
@@ -1954,6 +1954,27 @@ def check_for_update():
 
 # ======================= ОКНО НАСТРОЕК =======================
 
+# Цвета подписей под тему окон: тёмная (sv-ttk, как в Windows 11) или обычная
+UI = {"muted": "#666666", "ok": "#2E7D32", "err": "#C62828", "box": "#F4F1FA",
+      "box_fg": "#222222", "box_border": "#DDD6EE"}
+
+
+def apply_theme(root):
+    """Тёмная тема Sun Valley (пакет sv-ttk) для окон настроек и обновления.
+    Нет пакета — остаётся обычный вид Windows."""
+    try:
+        import sv_ttk
+        sv_ttk.set_theme("dark", root)
+        # фон и подписи тема перекрашивает по <<ThemeChanged>>, а оно до нас не доходит
+        root.tk.call("configure_colors")
+    except Exception as e:
+        print(f"[i] Тема оформления недоступна ({e}) — обычный вид окон.")
+        return False
+    UI.update(muted="#A09CAD", ok="#7BD88F", err="#FF8A80", box="#26222F",
+              box_fg="#ECEAF2", box_border="#3B3648")
+    return True
+
+
 KEY_CHOICES = [f"f{i}" for i in range(1, 13)] + [
     "insert", "home", "end", "page up", "page down", "pause", "scroll lock",
     "right ctrl", "right alt", "right shift", "caps lock",
@@ -2001,32 +2022,55 @@ class SettingsWindow:
             pass
         win.protocol("WM_DELETE_WINDOW", self.cancel)
 
-        frm = ttk.Frame(win, padding=14)
-        frm.pack(fill="both", expand=True)
-        frm.columnconfigure(0, weight=1)
+        outer = ttk.Frame(win, padding=(18, 14, 18, 14))
+        outer.pack(fill="both", expand=True)
 
-        # --- горячие клавиши ---
-        box = ttk.LabelFrame(frm, text="Горячие клавиши", padding=10)
-        box.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        # --- шапка: логотип и версия ---
+        from PIL import ImageTk
+        head = ttk.Frame(outer)
+        head.pack(fill="x", pady=(0, 12))
+        self.logo = ImageTk.PhotoImage(draw_icon(44), master=win)
+        ttk.Label(head, image=self.logo).pack(side="left", padx=(0, 12))
+        titles = ttk.Frame(head)
+        titles.pack(side="left")
+        ttk.Label(titles, text="Настройки", font=("Segoe UI Semibold", 16)).pack(anchor="w")
+        ttk.Label(titles, text=f"{APP_NAME} {APP_VERSION}  ·  By {APP_AUTHOR}",
+                  foreground=UI["muted"]).pack(anchor="w")
+
+        nb = self.nb = ttk.Notebook(outer)
+        nb.pack(fill="both", expand=True)
+
+        def tab(title):
+            f = ttk.Frame(nb, padding=(16, 14, 16, 14))
+            f.columnconfigure(1, weight=1)
+            nb.add(f, text=f"  {title}  ")
+            return f
+
+        def hint(parent, text, row, columnspan=3, pady=(10, 0)):
+            ttk.Label(parent, text=text, foreground=UI["muted"], justify="left"
+                      ).grid(row=row, column=0, columnspan=columnspan, sticky="w", pady=pady)
+
+        # --- клавиши ---
+        box = tab("Клавиши")
         self.keys = {}
         rows = [("HOTKEY", "Говорить (держать):", HOTKEY, False),
                 ("THEM_HOTKEY", "Перевести собеседника:", THEM_HOTKEY, False),
                 ("LIVE_HOTKEY", "Живой перевод (вкл/выкл):", LIVE_HOTKEY, False),
                 ("EXIT_HOTKEY", "Выход из программы:", EXIT_HOTKEY, True)]
-        for r, (var_name, label, value, combo) in enumerate(rows):
-            ttk.Label(box, text=label).grid(row=r, column=0, sticky="w", padx=(0, 10), pady=3)
+        for r_, (var_name, label, value, combo) in enumerate(rows):
+            ttk.Label(box, text=label).grid(row=r_, column=0, sticky="w", padx=(0, 14), pady=5)
             var = tk.StringVar(value=value)
-            ttk.Combobox(box, textvariable=var, width=20,
+            ttk.Combobox(box, textvariable=var, width=18,
                          values=EXIT_CHOICES if combo else KEY_CHOICES
-                         ).grid(row=r, column=1, sticky="w", pady=3)
-            btn = ttk.Button(box, text="Записать", width=11)
-            btn.config(command=lambda v=var, b=btn, c=combo: self.capture(v, b, c))
-            btn.grid(row=r, column=2, padx=(8, 0), pady=3)
+                         ).grid(row=r_, column=1, sticky="w", pady=5)
+            btn = ttk.Button(box, text="Записать", width=10)
+            btn.config(command=lambda v=var, b_=btn, c=combo: self.capture(v, b_, c))
+            btn.grid(row=r_, column=2, padx=(10, 0), pady=5)
             self.keys[var_name] = var
+        hint(box, "«Записать» — нажмите кнопку, а потом нужную клавишу на клавиатуре.", 9)
 
         # --- звук ---
-        box = ttk.LabelFrame(frm, text="Звук", padding=10)
-        box.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        box = tab("Звук")
         try:
             mics = input_devices()
         except Exception as e:
@@ -2039,80 +2083,87 @@ class SettingsWindow:
             outs = []
         self.mic_var, self.mic_map = self._device_row(box, 0, "Микрофон:", mics, MIC_DEVICE)
         self.out_var, self.out_map = self._device_row(
-            box, 1, "Звук собеседников\n(устройство вывода):", outs, LOOPBACK_DEVICE)
+            box, 1, "Звук собеседников:", outs, LOOPBACK_DEVICE)
         self.nums = {}
-        self._num_row(box, 2, "THEM_SECONDS", "Собеседник: сколько\nпоследних секунд переводить:",
-                      2, 30, 1)
+        self._num_row(box, 2, "THEM_SECONDS", "F10 переводит последние, сек:", 2, 30, 1)
+        hint(box, "«Звук собеседников» — устройство, в котором вы слышите игру и Discord\n"
+                  "(ваши наушники или колонки).", 9)
 
-        # --- текст на экране ---
         # --- языки ---
-        box = ttk.LabelFrame(frm, text="Языки", padding=10)
-        box.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        box = tab("Языки")
         self.NO_EXTRA = "Нет — только английский"
         self.lang_map = {self.NO_EXTRA: ""}
         for code in sorted(LANGUAGES, key=LANGUAGES.get):
             self.lang_map[LANGUAGES[code] + ("  ✓" if lang_downloaded(code) else "")] = code
         current = next((k for k, c in self.lang_map.items() if c == EXTRA_LANG), self.NO_EXTRA)
-        ttk.Label(box, text="Ещё один язык собеседников\n(кроме английского):"
-                  ).grid(row=0, column=0, sticky="w", padx=(0, 10), pady=3)
+        ttk.Label(box, text="Ещё один язык собеседников:"
+                  ).grid(row=0, column=0, sticky="w", padx=(0, 14), pady=5)
         self.extra_var = tk.StringVar(value=current)
         ttk.Combobox(box, textvariable=self.extra_var, values=list(self.lang_map), width=28,
-                     state="readonly", height=15).grid(row=0, column=1, sticky="w", pady=3)
+                     state="readonly", height=15).grid(row=0, column=1, sticky="w", pady=5)
         ttk.Label(box, text="Мою речь (F9) переводить на:"
-                  ).grid(row=1, column=0, sticky="w", padx=(0, 10), pady=3)
+                  ).grid(row=1, column=0, sticky="w", padx=(0, 14), pady=5)
         self.target_var = tk.StringVar(
             value=lang_name(TARGET_LANG) if TARGET_LANG == EXTRA_LANG and EXTRA_LANG else "Английский")
         self.target_box = ttk.Combobox(box, textvariable=self.target_var, width=28, state="readonly")
-        self.target_box.grid(row=1, column=1, sticky="w", pady=3)
-        ttk.Label(box, foreground="#666", justify="left",
-                  text="✓ — уже скачан. Новый язык скачается после «Применить» (~700 МБ).\n"
-                       "С русского и на русский переводится через английский."
-                  ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.target_box.grid(row=1, column=1, sticky="w", pady=5)
+        # состояние выбранного языка: скачивается / готов / ошибка
+        stat = ttk.Frame(box)
+        stat.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        self.lang_status = ttk.Label(stat, text="", justify="left")
+        self.lang_status.pack(side="left")
+        self.lang_retry = ttk.Button(stat, text="Повторить", command=self.retry_language)
+        hint(box, "✓ — уже скачан. Новый язык скачивается после «Применить» (~700 МБ, один раз),\n"
+                  "пока он качается, Kat переводит на английский.\n"
+                  "Перевод с русского и на русский для других языков идёт через английский.", 9,
+             pady=(14, 0))
         self.extra_var.trace_add("write", lambda *_: self._update_targets())
         self._update_targets()
 
-        box = ttk.LabelFrame(frm, text="Текст на экране", padding=10)
-        box.grid(row=3, column=0, sticky="ew", pady=(0, 10))
-        ttk.Label(box, text="Прозрачность текста:").grid(row=0, column=0, sticky="w", pady=3)
+        # --- вид ---
+        box = tab("Вид")
+        ttk.Label(box, text="Прозрачность текста:").grid(row=0, column=0, sticky="w", pady=5)
         self.opacity = tk.DoubleVar(value=TEXT_OPACITY)
-        ttk.Scale(box, from_=0.2, to=1.0, variable=self.opacity, length=220
-                  ).grid(row=0, column=1, sticky="w", pady=3)
+        ttk.Scale(box, from_=0.2, to=1.0, variable=self.opacity, length=240
+                  ).grid(row=0, column=1, sticky="w", pady=5)
         self.opacity_label = ttk.Label(box, width=5)
-        self.opacity_label.grid(row=0, column=2, sticky="w", padx=(8, 0))
-        ttk.Label(box, text="Фон под текстом:").grid(row=1, column=0, sticky="w", pady=3)
+        self.opacity_label.grid(row=0, column=2, sticky="w", padx=(10, 0))
+        ttk.Label(box, text="Фон под текстом:").grid(row=1, column=0, sticky="w", pady=5)
         self.panel = tk.DoubleVar(value=PANEL_OPACITY)
-        ttk.Scale(box, from_=0.0, to=1.0, variable=self.panel, length=220
-                  ).grid(row=1, column=1, sticky="w", pady=3)
+        ttk.Scale(box, from_=0.0, to=1.0, variable=self.panel, length=240
+                  ).grid(row=1, column=1, sticky="w", pady=5)
         self.panel_label = ttk.Label(box, width=5)
-        self.panel_label.grid(row=1, column=2, sticky="w", padx=(8, 0))
+        self.panel_label.grid(row=1, column=2, sticky="w", padx=(10, 0))
         # цвета: квадратики, по щелчку — выбор цвета
-        ttk.Label(box, text="Цвета:").grid(row=2, column=0, sticky="nw", pady=(6, 3))
+        ttk.Label(box, text="Цвета:").grid(row=2, column=0, sticky="nw", pady=(10, 5))
         cf = ttk.Frame(box)
-        cf.grid(row=2, column=1, columnspan=2, sticky="w", pady=(6, 3))
+        cf.grid(row=2, column=1, columnspan=2, sticky="w", pady=(10, 5))
         self.colors = {}
         for i, (var_name, caption) in enumerate(self.COLORS):
             var = tk.StringVar(value=globals()[var_name])
-            sw_ = tk.Label(cf, width=4, bg=var.get(), relief="solid", bd=1, cursor="hand2")
-            sw_.grid(row=0, column=i, padx=(0, 12))
-            ttk.Label(cf, text=caption, foreground="#555").grid(row=1, column=i, padx=(0, 12))
+            sw_ = tk.Label(cf, width=5, height=1, bg=var.get(), relief="flat", bd=0,
+                           highlightthickness=2, highlightbackground=UI["box_border"],
+                           cursor="hand2")
+            sw_.grid(row=0, column=i, padx=(0, 14))
+            ttk.Label(cf, text=caption, foreground=UI["muted"]).grid(row=1, column=i,
+                                                                     padx=(0, 14), pady=(3, 0))
             sw_.bind("<Button-1>", lambda _e, n=var_name, c=caption: self.pick_color(n, c))
             self.colors[var_name] = (var, sw_)
         sh = win.winfo_screenheight()
         spins = [("FONT_SIZE", "Размер шрифта:", 8, 96, 1),
-                 ("DISPLAY_SECONDS", "Время показа, секунд:", 1, 60, 1),
-                 ("Y_FROM_BOTTOM", "Мой перевод — отступ снизу, пикс.:", 0, sh, 10),
-                 ("THEM_Y_FROM_TOP", "Перевод собеседника — отступ сверху, пикс.:", 0, sh, 10)]
-        for r, spin in enumerate(spins, start=3):
-            self._num_row(box, r, *spin)
+                 ("DISPLAY_SECONDS", "Время показа, сек:", 1, 60, 1),
+                 ("Y_FROM_BOTTOM", "Мой перевод — отступ снизу:", 0, sh, 10),
+                 ("THEM_Y_FROM_TOP", "Собеседник — отступ сверху:", 0, sh, 10)]
+        for r_, spin in enumerate(spins, start=3):
+            self._num_row(box, r_, *spin)
         foot = ttk.Frame(box)
-        foot.grid(row=20, column=0, columnspan=3, sticky="ew", pady=(6, 0))
-        ttk.Label(foot, text="Пока окно открыто, на экране показан пример текста.",
-                  foreground="#666").pack(side="left")
+        foot.grid(row=20, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        ttk.Label(foot, text="Пример текста показан на экране, пока открыта эта вкладка.",
+                  foreground=UI["muted"]).pack(side="left")
         ttk.Button(foot, text="Вид по умолчанию", command=self.reset_look).pack(side="right")
 
-        # --- запуск ---
-        box = ttk.LabelFrame(frm, text="Запуск", padding=10)
-        box.grid(row=4, column=0, sticky="ew", pady=(0, 10))
+        # --- запуск и о программе ---
+        box = tab("Запуск")
         try:
             self.autostart_was = autostart_enabled()
         except Exception as e:
@@ -2120,34 +2171,49 @@ class SettingsWindow:
             self.autostart_was = False
         self.autostart = tk.BooleanVar(value=self.autostart_was)
         ttk.Checkbutton(box, text="Запускать вместе с Windows", variable=self.autostart
-                        ).grid(row=0, column=0, sticky="w", pady=2)
+                        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=4)
         self.admin = tk.BooleanVar(value=RUN_AS_ADMIN)
         ttk.Checkbutton(box, text="Запускать от имени администратора", variable=self.admin
-                        ).grid(row=1, column=0, sticky="w", pady=2)
-        now = "сейчас запущен от администратора" if is_admin() else "сейчас запущен с обычными правами"
-        ttk.Label(box, foreground="#666", justify="left",
-                  text="Нужно, если игра запущена от администратора (например Genshin Impact) —\n"
-                       f"иначе F9/F10 внутри игры не срабатывают. ({now})"
-                  ).grid(row=2, column=0, sticky="w", padx=(22, 0))
+                        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=4)
+        now = "сейчас: от администратора" if is_admin() else "сейчас: обычные права"
+        ttk.Label(box, foreground=UI["muted"], justify="left",
+                  text="Нужно, если игра запущена от администратора (например Genshin Impact),\n"
+                       f"иначе клавиши внутри игры не срабатывают ({now})."
+                  ).grid(row=2, column=0, columnspan=3, sticky="w", padx=(28, 0))
         self.updates = tk.BooleanVar(value=CHECK_UPDATES)
         ttk.Checkbutton(box, text="Проверять обновления при запуске", variable=self.updates
-                        ).grid(row=3, column=0, sticky="w", pady=(6, 2))
+                        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(10, 4))
+        ttk.Separator(box).grid(row=4, column=0, columnspan=3, sticky="ew", pady=(12, 12))
+        about = ttk.Frame(box)
+        about.grid(row=5, column=0, columnspan=3, sticky="ew")
+        ttk.Button(about, text="Проверить обновления",
+                   command=self.check_updates_now).pack(side="left")
+        ttk.Button(about, text="Страница проекта",
+                   command=lambda: __import__("webbrowser").open(
+                       f"https://github.com/{GITHUB_REPO}")).pack(side="left", padx=8)
+        ttk.Button(about, text="Открыть папку Kat",
+                   command=lambda: os.startfile(BASE_DIR)).pack(side="left")
+        self.about_status = ttk.Label(box, text="", foreground=UI["muted"])
+        self.about_status.grid(row=6, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         # --- кнопки ---
-        bar = ttk.Frame(frm)
-        bar.grid(row=5, column=0, sticky="ew")
-        self.status = ttk.Label(bar, foreground="#2E7D32")
-        ttk.Label(frm, text=f"{APP_NAME} {APP_VERSION} · By {APP_AUTHOR}", foreground="#888"
-                  ).grid(row=6, column=0, sticky="e", pady=(8, 0))
+        bar = ttk.Frame(outer)
+        bar.pack(fill="x", pady=(14, 0))
+        self.status = ttk.Label(bar, foreground=UI["ok"])
         self.status.pack(side="left")
-        ttk.Button(bar, text="Применить", command=lambda: self.apply(False)).pack(side="right")
-        ttk.Button(bar, text="Отмена", command=self.cancel).pack(side="right", padx=6)
-        ttk.Button(bar, text="ОК", command=lambda: self.apply(True)).pack(side="right")
+        accent = {"style": "Accent.TButton"} if app.themed else {}
+        ttk.Button(bar, text="ОК", width=10, command=lambda: self.apply(True), **accent
+                   ).pack(side="right")
+        ttk.Button(bar, text="Отмена", width=10, command=self.cancel).pack(side="right", padx=8)
+        ttk.Button(bar, text="Применить", width=10, command=lambda: self.apply(False)
+                   ).pack(side="right")
 
         for var in ([self.opacity, self.panel] + [v for v, *_ in self.nums.values()]
                     + [v for v, _ in self.colors.values()]):
             var.trace_add("write", lambda *_: self.preview())
-        self.preview()
+        self.view_tab = 3  # пример текста на экране — только на вкладке «Вид»
+        nb.bind("<<NotebookTabChanged>>", lambda _e: self._tab_changed())
+        self.show_lang_status()
 
         win.update_idletasks()
         x = (win.winfo_screenwidth() - win.winfo_width()) // 2
@@ -2167,6 +2233,61 @@ class SettingsWindow:
         self.target_box.config(values=values)
         if self.target_var.get() not in values:
             self.target_var.set("Английский")
+        if hasattr(self, "lang_status"):
+            self.show_lang_status()
+
+    def show_lang_status(self):
+        """Строка состояния выбранного языка (её же обновляет App, пока язык качается)."""
+        if not self.win.winfo_exists():
+            return
+        extra = self.lang_map.get(self.extra_var.get(), "")
+        self.lang_retry.pack_forget()
+        if extra != EXTRA_LANG:  # выбрали, но ещё не применили
+            text = (f"Нажмите «Применить» — {lang_name(extra)} скачается и подключится."
+                    if extra and not lang_downloaded(extra)
+                    else "Нажмите «Применить», чтобы сменить язык." if extra or EXTRA_LANG else "")
+            self.lang_status.config(text=text, foreground=UI["muted"])
+            return
+        text, state = self.app.lang_status()
+        self.lang_status.config(text=text, foreground={"ready": UI["ok"], "error": UI["err"]}
+                                .get(state, UI["muted"]))
+        if state == "error":
+            self.lang_retry.pack(side="left", padx=(12, 0))
+
+    def retry_language(self):
+        self.app.set_extra_language(EXTRA_LANG)
+        self.show_lang_status()
+
+    def _tab_changed(self):
+        if self.nb.index("current") == self.view_tab:
+            self.preview()
+        else:
+            self.app.overlays["me"].hide()
+            self.app.overlays["them"].hide()
+
+    def check_updates_now(self):
+        self.about_status.config(text="Проверяю...", foreground=UI["muted"])
+        app = self.app
+
+        def work():
+            try:
+                info = check_for_update()
+            except Exception as e:
+                msg, color = f"Не удалось проверить: {e}", UI["err"]
+                info = None
+            else:
+                msg, color = ((f"Есть новая версия {info[0]}!", UI["ok"]) if info
+                              else (f"У вас последняя версия ({APP_VERSION}) ✓", UI["ok"]))
+
+            def done():
+                if self.win.winfo_exists():
+                    self.about_status.config(text=msg, foreground=color)
+                if info:
+                    app.update_info = info
+                    app.update_tray()
+                    app.open_update_page()
+            app.call_in_ui(done)
+        threading.Thread(target=work, daemon=True, name="check-updates").start()
 
     def _num_row(self, box, row, var_name, label, lo, hi, step):
         from tkinter import ttk
@@ -2265,6 +2386,8 @@ class SettingsWindow:
         ov["them"].place(y_from_top=THEM_Y_FROM_TOP)
 
     def preview(self):
+        if self.nb.index("current") != self.view_tab:
+            return
         self.opacity_label.config(text=f"{self.opacity.get():.2f}")
         self.panel_label.config(text=f"{self.panel.get():.2f}")
         try:
@@ -2362,10 +2485,11 @@ class SettingsWindow:
             self.close()
             app.restart(admin=True)
             return
+        self.show_lang_status()
         if close:
             self.close()
         else:
-            self.status.config(text="Сохранено и применено")
+            self.status.config(text="Сохранено и применено ✓")
             self.win.after(3000, lambda: self.win.winfo_exists() and self.status.config(text=""))
 
     def cancel(self):
@@ -2429,15 +2553,16 @@ class UpdateWindow:
         ttk.Label(titles, text=f"Вышла новая версия {APP_NAME} {version}",
                   font=("Segoe UI", 15, "bold")).pack(anchor="w")
         ttk.Label(titles, text=f"У вас сейчас {APP_VERSION}  ·  By {APP_AUTHOR}",
-                  foreground="#777").pack(anchor="w", pady=(2, 0))
+                  foreground=UI["muted"]).pack(anchor="w", pady=(2, 0))
 
         ttk.Label(frm, text="Что нового", font=("Segoe UI", 10, "bold")
                   ).pack(anchor="w", pady=(16, 6))
-        box = tk.Frame(frm, bg="#F4F1FA", highlightthickness=1, highlightbackground="#DDD6EE")
+        box = tk.Frame(frm, bg=UI["box"], highlightthickness=1,
+                       highlightbackground=UI["box_border"])
         box.pack(fill="both")
         txt = tk.Text(box, width=66, height=11, wrap="word", font=("Segoe UI", 10),
-                      relief="flat", bg="#F4F1FA", padx=12, pady=10, borderwidth=0,
-                      highlightthickness=0, spacing1=1, spacing3=1)
+                      relief="flat", bg=UI["box"], fg=UI["box_fg"], padx=12, pady=10,
+                      borderwidth=0, highlightthickness=0, spacing1=1, spacing3=1)
         scroll = ttk.Scrollbar(box, command=txt.yview)
         txt.config(yscrollcommand=scroll.set)
         txt.pack(side="left", fill="both", expand=True)
@@ -2448,10 +2573,10 @@ class UpdateWindow:
         self.pframe = ttk.Frame(frm)
         self.pframe.pack(fill="x", pady=(14, 0))
         self.progress = ttk.Progressbar(self.pframe, mode="determinate", maximum=100)
-        self.status = ttk.Label(self.pframe, foreground="#555")
+        self.status = ttk.Label(self.pframe, foreground=UI["muted"])
         self.self_update = app.can_self_update()
         if not self.self_update:
-            ttk.Label(self.pframe, foreground="#777", justify="left",
+            ttk.Label(self.pframe, foreground=UI["muted"], justify="left",
                       text="Kat запущен из исходников: новая версия скачивается со страницы "
                            "релиза.\nПроще всего — установить KatSetup.exe оттуда: настройки и "
                            "модели перенесутся сами.").pack(anchor="w")
@@ -2459,7 +2584,8 @@ class UpdateWindow:
         bar = ttk.Frame(frm)
         bar.pack(fill="x", pady=(14, 0))
         self.btn_go = ttk.Button(bar, text="Обновить сейчас" if self.self_update
-                                 else "Открыть страницу загрузки", command=self.go)
+                                 else "Открыть страницу загрузки", command=self.go,
+                                 **({"style": "Accent.TButton"} if app.themed else {}))
         self.btn_go.pack(side="right")
         self.btn_later = ttk.Button(bar, text="Позже", command=self.close)
         self.btn_later.pack(side="right", padx=8)
@@ -2509,6 +2635,7 @@ class App:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title(APP_NAME)
+        self.themed = apply_theme(self.root)
         self.overlays = {
             "me": make_overlay(self.root, y_from_bottom=Y_FROM_BOTTOM),
             "them": make_overlay(tk.Toplevel(self.root), y_from_top=THEM_Y_FROM_TOP),
@@ -2525,6 +2652,7 @@ class App:
         self.update_info = None  # (версия, ссылка, что нового), если на GitHub есть новее
         self.glossary = None  # словарь glossary.txt — общий для всех моделей перевода
         self.update_window = None
+        self.lang_state = None  # (код, "loading" | "ready" | "error", текст) — для настроек
         self.settings_window = None
         self.tray = None
 
@@ -2614,11 +2742,16 @@ class App:
                 them_info = ""
             if EXTRA_LANG in LANGUAGES:
                 try:
+                    self._set_lang_state(EXTRA_LANG, "loading",
+                                         f"{lang_name(EXTRA_LANG)}: загружаю модели...")
                     for d in (f"{EXTRA_LANG}-en", f"en-{EXTRA_LANG}"):
                         self.load_mt(d)
                     print(f"Дополнительный язык: {lang_name(EXTRA_LANG)}")
+                    self._set_lang_state(EXTRA_LANG, "ready", f"{lang_name(EXTRA_LANG)}: готов ✓")
                 except Exception as e:
                     print(f"[!] Модели для языка {lang_name(EXTRA_LANG)} не загрузились: {e}")
+                    self._set_lang_state(EXTRA_LANG, "error",
+                                         f"{lang_name(EXTRA_LANG)}: не удалось загрузить ({e})")
             print(f"Готово ({desc}). Держи {HOTKEY.upper()} и говори{them_info}, "
                   f"{LIVE_HOTKEY.upper()} — живой перевод. "
                   f"Выход: {EXIT_HOTKEY} или через иконку в трее.")
@@ -2779,22 +2912,52 @@ class App:
             threading.Thread(target=self._install_language, args=(code,),
                              daemon=True, name="language").start()
 
+    def lang_status(self):
+        """(текст, состояние) дополнительного языка для окна настроек."""
+        code = EXTRA_LANG
+        if not code:
+            return "", None
+        name = lang_name(code)
+        if self.lang_state and self.lang_state[0] == code:
+            return self.lang_state[2], self.lang_state[1]
+        if self.has_chain(code, SOURCE_LANG):
+            return f"{name}: готов ✓", "ready"
+        if self.state["model"] is None:
+            return f"{name}: подключится, когда Kat загрузится", "loading"
+        return f"{name}: модели не загружены", "error"
+
+    def _set_lang_state(self, code, state, text):
+        self.lang_state = (code, state, text)
+        w = self.settings_window
+        if w is not None:
+            self.call_in_ui(w.show_lang_status)
+
     def _install_language(self, code):
         global _download_hook
         if self.state["model"] is None:  # модели ещё грузятся — язык подхватит loader
             return
         name = lang_name(code)
+        self._set_lang_state(code, "loading", f"{name}: загружаю модели перевода...")
         self.show("me", f"{name}: загружаю модели перевода...")
-        _download_hook = lambda text: self.show("me", f"{name}: {text}")  # noqa: E731
+
+        def hook(text):
+            self.show("me", [(f"{name}: скачиваю модели", text)])
+            pct = re.search(r"(\d+%)", text)
+            part = "1 из 2" if f"quickmt-{code}-en" in text else "2 из 2"
+            self._set_lang_state(code, "loading", f"{name}: скачиваю модели ({part})"
+                                                  + (f" — {pct.group(1)}" if pct else "..."))
+        _download_hook = hook
         try:
             for d in (f"{code}-en", f"en-{code}"):
                 self.load_mt(d)
             print(f"Дополнительный язык: {name} — готово")
-            self.show("me", f"{name}: готово! Собеседников на этом языке Kat теперь переводит", 5)
+            self._set_lang_state(code, "ready", f"{name}: готов ✓")
+            self.show("me", [(f"{name}: готово ✓", "Kat переводит этот язык")], 5)
         except Exception as e:
             traceback.print_exc()
-            self.show("me", f"{name}: не удалось скачать модели ({e}).\n"
-                            "Проверьте интернет и выберите язык в настройках ещё раз", 10)
+            self._set_lang_state(code, "error", f"{name}: не удалось скачать ({e})")
+            self.show("me", [(f"{name}: не удалось скачать модели",
+                              "Проверьте интернет и нажмите «Повторить» в настройках → «Языки»")], 10)
         finally:
             _download_hook = None
 
@@ -2842,7 +3005,12 @@ class App:
                 self.show("me", "(ничего не расслышал)", 2)
                 return
             print(f"[я] {ru}\n{en}")
-            self.show("me", [(en, ru if SHOW_ORIGINAL else None)], DISPLAY_SECONDS, TEXT_COLOR)
+            sub = ru if SHOW_ORIGINAL else ""
+            if TARGET_LANG != "en" and target == "en":  # выбранный язык ещё качается
+                note = f"⚠ {lang_name(TARGET_LANG)} ещё не готов — пока перевожу на английский"
+                print(f"[я] {note}")
+                sub = f"{sub}\n{note}" if sub else note
+            self.show("me", [(en, sub or None)], DISPLAY_SECONDS, TEXT_COLOR)
             if COPY_TO_CLIPBOARD:
                 self.ui_q.put(("clip", en))
         except Exception as e:
@@ -3288,6 +3456,7 @@ def selftest(args):
     print(f"selftest: {APP_NAME} {APP_VERSION}, frozen={FROZEN}, папка {BASE_DIR}")
     root = tk.Tk()
     root.withdraw()
+    print(f"selftest: тема окон {'ok' if apply_theme(root) else 'НЕТ'}")
     root.destroy()
     print("selftest: tkinter ok; микрофонов:", sum(1 for d in sd.query_devices()
                                                   if d["max_input_channels"] > 0))

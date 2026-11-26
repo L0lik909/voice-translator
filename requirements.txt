@@ -8,3 +8,4 @@ nvidia-cublas-cu12
 nvidia-cudnn-cu12==9.*
 pystray
 Pillow
+sv-ttk

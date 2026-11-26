@@ -10,7 +10,8 @@ a = Analysis(
     [os.path.join(ROOT, "translator.py")],
     pathex=[ROOT],
     binaries=collect_dynamic_libs("ctranslate2"),
-    datas=collect_data_files("faster_whisper"),  # модель VAD Silero (assets/*.onnx)
+    datas=collect_data_files("faster_whisper")  # модель VAD Silero (assets/*.onnx)
+          + collect_data_files("sv_ttk"),  # тёмная тема окон (tcl + картинки)
     hiddenimports=["pystray._win32", "PIL._tkinter_finder"],
     excludes=["matplotlib", "IPython", "pytest", "tkinter.test", "unittest"],
     noarchive=False,
