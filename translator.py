@@ -35,10 +35,12 @@ import collections
 import configparser
 
 APP_NAME = "Kat"
-APP_VERSION = "1.1.0"  # менять при каждом обновлении + запись в CHANGELOG.md
+APP_VERSION = "1.2.0"  # менять при каждом обновлении + запись в CHANGELOG.md
 OLD_APP_NAMES = ("Голосовой переводчик",)  # прежние названия — их ярлыки заменяем новыми
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SCRIPT = os.path.abspath(__file__)
+# FROZEN — запущены как Kat.exe из установщика (PyInstaller), а не как translator.py
+FROZEN = bool(getattr(sys, "frozen", False))
+SCRIPT = sys.executable if FROZEN else os.path.abspath(__file__)
+BASE_DIR = os.path.dirname(SCRIPT)
 SETTINGS_FILE = os.path.join(BASE_DIR, "settings.ini")
 LOG_FILE = os.path.join(BASE_DIR, "log.txt")
 ICON_VERSION = 3  # увеличить, когда меняется рисунок в draw_icon
@@ -50,6 +52,7 @@ REQUIREMENTS = os.path.join(BASE_DIR, "requirements.txt")
 REQ_STAMP = os.path.join(BASE_DIR, "venv", "requirements.sha256")  # пишет start.bat
 SAMPLE_RATE = 16000  # Whisper работает только с 16 кГц — не настройка
 GITHUB_REPO = "L0lik909/voice-translator"  # отсюда проверяются обновления (релизы)
+CUDA_DIR = os.path.join(BASE_DIR, "cuda")  # Kat.exe: сюда докачиваются DLL для видеокарты
 
 
 # ======================= ЛОГ =======================
@@ -160,6 +163,10 @@ model_size = large-v3-turbo
 ; Язык, на котором я говорю.
 source_lang = ru
 
+; На какой язык переводить мою речь: en (английский) или дополнительный язык
+; собеседников (extra_lang ниже). Удобнее выбрать в окне «Настройки».
+target_lang = en
+
 ; Показывать и оригинал, и перевод (да / нет).
 show_original = да
 
@@ -179,6 +186,11 @@ hotkey = f10
 
 ; Сколько последних секунд звука переводить.
 seconds = 10
+
+; Дополнительный язык собеседников (кроме английского): код языка, например
+; de (немецкий), es (испанский), ja (японский). Пусто — только английский.
+; Удобнее выбрать в окне «Настройки» — там же скачаются модели (~700 МБ).
+extra_lang =
 
 ; Живой перевод: Kat сам слушает собеседников и переводит их прямо по ходу
 ; речи (без нажатия клавиши), как субтитры. Русскую речь пропускает.
@@ -243,11 +255,13 @@ SPEC = [
     ("HOTKEY", "моя_речь", "hotkey", "str"),
     ("MODEL_SIZE", "моя_речь", "model_size", "str"),
     ("SOURCE_LANG", "моя_речь", "source_lang", "str"),
+    ("TARGET_LANG", "моя_речь", "target_lang", "str"),
     ("SHOW_ORIGINAL", "моя_речь", "show_original", "bool"),
     ("COPY_TO_CLIPBOARD", "моя_речь", "copy_to_clipboard", "bool"),
     ("MIC_DEVICE", "моя_речь", "mic_device", "device"),
     ("THEM_HOTKEY", "собеседники", "hotkey", "str"),
     ("THEM_SECONDS", "собеседники", "seconds", "float"),
+    ("EXTRA_LANG", "собеседники", "extra_lang", "str"),
     ("LIVE_HOTKEY", "собеседники", "live_hotkey", "str"),
     ("LIVE", "собеседники", "live", "bool"),
     ("LOOPBACK_DEVICE", "собеседники", "loopback_device", "device"),
@@ -374,17 +388,26 @@ set_settings(load_settings())
 # =========================================================
 
 
+_cuda_dirs_added = set()
+
+
 def add_cuda_dlls():
-    """Подключает DLL CUDA из pip-пакетов nvidia-cublas / nvidia-cudnn (Windows)."""
+    """Подключает DLL CUDA: из pip-пакетов nvidia-cublas / nvidia-cudnn (запуск из
+    исходников) или из папки cuda рядом с Kat.exe (их докачивает ensure_cuda_libs)."""
     if os.name != "nt":
         return
-    for sp in list(sys.path):
-        for d in glob.glob(os.path.join(sp, "nvidia", "*", "bin")):
-            try:
-                os.add_dll_directory(d)
-            except (OSError, AttributeError):
-                pass
-            os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+    dirs = [d for sp in list(sys.path) for d in glob.glob(os.path.join(sp, "nvidia", "*", "bin"))]
+    if os.path.isdir(CUDA_DIR):
+        dirs.append(CUDA_DIR)
+    for d in dirs:
+        if d in _cuda_dirs_added:
+            continue
+        _cuda_dirs_added.add(d)
+        try:
+            os.add_dll_directory(d)
+        except (OSError, AttributeError):
+            pass
+        os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
 
 
 add_cuda_dlls()
@@ -478,6 +501,71 @@ def download_repo(repo, name, required, optional=()):
         if not result and fname in required:
             raise RuntimeError(f"Не удалось скачать {fname}")
     return folder
+
+
+# Библиотеки NVIDIA для видеокарты весят ~2 ГБ, поэтому в установщик не входят:
+# Kat.exe докачивает их с PyPI при первом запуске, если в системе есть драйвер NVIDIA.
+# Версии — те же, с которыми программа проверена (как в requirements.txt).
+CUDA_WHEELS = [("nvidia-cublas-cu12", "12.9.2.10"),
+               ("nvidia-cuda-nvrtc-cu12", "12.9.86"),
+               ("nvidia-cudnn-cu12", "9.28.1.4")]
+CUDA_SKIP = ("nvblas",)  # эти DLL программе не нужны
+
+
+def has_nvidia_gpu():
+    """Есть ли драйвер NVIDIA (nvcuda.dll ставится вместе с ним)."""
+    try:
+        ctypes.WinDLL("nvcuda.dll")
+        return True
+    except OSError:
+        return False
+
+
+def ensure_cuda_libs():
+    """Kat.exe + видеокарта NVIDIA: скачать DLL CUDA в папку cuda, если их ещё нет.
+    Ничего не делает при запуске из исходников (там DLL ставит pip)."""
+    import json
+    import urllib.request
+    import zipfile
+    done_mark = os.path.join(CUDA_DIR, "ok.txt")
+    if not FROZEN or os.path.exists(done_mark) or not has_nvidia_gpu():
+        return
+    os.makedirs(CUDA_DIR, exist_ok=True)
+    print("Видеокарта NVIDIA: докачиваю библиотеки CUDA (~2 ГБ, один раз)...")
+    for pkg, ver in CUDA_WHEELS:
+        req = urllib.request.Request(f"https://pypi.org/pypi/{pkg}/{ver}/json",
+                                     headers={"User-Agent": f"Kat/{APP_VERSION}"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            files = json.load(resp)["urls"]
+        url = next(f["url"] for f in files if f["filename"].endswith("win_amd64.whl"))
+        whl = os.path.join(CUDA_DIR, url.rsplit("/", 1)[1])
+        for attempt in range(10):
+            try:
+                download_file(url, whl)
+                break
+            except Exception as e:
+                if attempt == 9:
+                    raise
+                print(f"[!] {pkg}: {type(e).__name__}: {e}. Пробую снова...")
+                time.sleep(3)
+        if _download_hook:
+            _download_hook(f"Распаковываю {pkg}...")
+        with zipfile.ZipFile(whl) as z:  # из колеса нужны только DLL из nvidia/*/bin
+            for name in z.namelist():
+                base = name.rsplit("/", 1)[-1]
+                if "/bin/" in name and base.lower().endswith(".dll") \
+                        and not base.lower().startswith(CUDA_SKIP):
+                    with z.open(name) as src, open(os.path.join(CUDA_DIR, base), "wb") as dst:
+                        while True:
+                            chunk = src.read(1 << 20)
+                            if not chunk:
+                                break
+                            dst.write(chunk)
+        os.remove(whl)
+    with open(done_mark, "w", encoding="utf-8") as f:
+        f.write(" ".join(f"{p}=={v}" for p, v in CUDA_WHEELS))
+    add_cuda_dlls()
+    print("Библиотеки CUDA готовы.")
 
 
 # У turbo нет сборки от Systran; репозиторий mobiuslabsgmbh переехал в dropbox-dash
@@ -783,6 +871,29 @@ class Glossary:
         for rx, v in self.words.get(direction, []):
             sentence = rx.sub(lambda m, v=v: sub(m, v), sentence)
         return sentence
+
+
+# Языки, для которых у quickmt есть модели перевода в обе стороны с английским.
+# Перевод с русского и на русский для них идёт через английский (ru -> en -> de).
+LANGUAGES = {
+    "ar": "Арабский", "bn": "Бенгальский", "cs": "Чешский", "da": "Датский",
+    "de": "Немецкий", "el": "Греческий", "es": "Испанский", "fa": "Персидский",
+    "fr": "Французский", "he": "Иврит", "hi": "Хинди", "hu": "Венгерский",
+    "id": "Индонезийский", "is": "Исландский", "it": "Итальянский", "ja": "Японский",
+    "ko": "Корейский", "lv": "Латышский", "pl": "Польский", "pt": "Португальский",
+    "ro": "Румынский", "sv": "Шведский", "th": "Тайский", "tr": "Турецкий",
+    "uk": "Украинский", "ur": "Урду", "vi": "Вьетнамский", "zh": "Китайский",
+}
+
+
+def lang_name(code):
+    return {"en": "Английский", "ru": "Русский"}.get(code) or LANGUAGES.get(code, code)
+
+
+def lang_downloaded(code):
+    """Скачаны ли обе модели перевода для языка (code->en и en->code)."""
+    return all(os.path.exists(os.path.join(MODELS_DIR, f"quickmt-{d}", "model.bin"))
+               for d in (f"{code}-en", f"en-{code}"))
 
 
 class TextTranslator:
@@ -1221,10 +1332,17 @@ def is_admin():
 
 
 def launcher():
-    """Чем запускать программу без консоли: pythonw.exe из venv."""
+    """Чем запускать программу без консоли: Kat.exe или pythonw.exe из venv."""
+    if FROZEN:
+        return sys.executable
     if os.path.exists(PYTHONW):
         return PYTHONW
     return os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+
+
+def launch_args(*extra):
+    """Аргументы для launcher(): у Kat.exe скрипта нет, у pythonw — путь к translator.py."""
+    return " ".join(([] if FROZEN else [f'"{SCRIPT}"']) + list(extra))
 
 
 def make_icon_file():
@@ -1266,7 +1384,7 @@ def create_shortcuts(only_existing=False):
     )
     # пути передаём через переменные окружения — так не мешают пробелы и кириллица
     env = dict(os.environ, VT_NAME=SHORTCUT_NAME, VT_TARGET=launcher(),
-               VT_ARGS=f'"{SCRIPT}"', VT_DIR=BASE_DIR, VT_ICON=f"{ICON_FILE},0",
+               VT_ARGS=launch_args(), VT_DIR=BASE_DIR, VT_ICON=f"{ICON_FILE},0",
                VT_DESC="Kat — голосовой переводчик для игр (F9 — говорить, F10 — перевести собеседника)",
                VT_OLD="|".join(n + ".lnk" for n in OLD_APP_NAMES),
                VT_ONLY="1" if only_existing else "0")
@@ -1286,6 +1404,8 @@ def create_shortcuts(only_existing=False):
 
 def requirements_changed():
     """True, если requirements.txt поменялся после последней установки через start.bat."""
+    if FROZEN:
+        return False  # у Kat.exe всё нужное уже внутри
     try:
         with open(REQUIREMENTS, "rb") as f:
             want = hashlib.sha256(f.read()).hexdigest()
@@ -1298,7 +1418,7 @@ def requirements_changed():
 
 def relaunch(admin=False):
     """Запускает новую копию (она дождётся закрытия этой). True — если запустилась."""
-    params = f'"{SCRIPT}" --restart' + (" --elevated" if admin else "")
+    params = launch_args("--restart", *(["--elevated"] if admin else []))
     shell = ctypes.windll.shell32
     shell.ShellExecuteW.restype = ctypes.c_ssize_t
     r = shell.ShellExecuteW(None, "runas" if admin else "open", launcher(), params, BASE_DIR, 1)
@@ -1348,7 +1468,7 @@ def _set_run_value(on):
     import winreg
     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
         if on:
-            winreg.SetValueEx(k, RUN_VALUE, 0, winreg.REG_SZ, f'"{launcher()}" "{SCRIPT}"')
+            winreg.SetValueEx(k, RUN_VALUE, 0, winreg.REG_SZ, f'"{launcher()}" {launch_args()}'.strip())
         else:
             try:
                 winreg.DeleteValue(k, RUN_VALUE)
@@ -1376,7 +1496,7 @@ def _task_xml(run_level="HighestAvailable"):
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
     <Priority>7</Priority>
   </Settings>
-  <Actions Context="Author"><Exec><Command>{e(launcher())}</Command><Arguments>"{e(SCRIPT)}" --elevated</Arguments><WorkingDirectory>{e(BASE_DIR)}</WorkingDirectory></Exec></Actions>
+  <Actions Context="Author"><Exec><Command>{e(launcher())}</Command><Arguments>{e(launch_args("--elevated"))}</Arguments><WorkingDirectory>{e(BASE_DIR)}</WorkingDirectory></Exec></Actions>
 </Task>
 """
 
@@ -1428,8 +1548,8 @@ def _version_tuple(v):
 
 
 def check_for_update():
-    """Последний релиз на GitHub. (версия, ссылка, что нового), если он новее этой версии,
-    иначе None. Ошибки сети — исключением (их ловит вызывающий)."""
+    """Последний релиз на GitHub: (версия, ссылка, что нового, ссылка на KatSetup.exe или None),
+    если он новее этой версии, иначе None. Ошибки сети — исключением (их ловит вызывающий)."""
     import json
     import urllib.request
     req = urllib.request.Request(
@@ -1441,7 +1561,9 @@ def check_for_update():
     if not tag or _version_tuple(tag) <= _version_tuple(APP_VERSION):
         return None
     url = data.get("html_url") or f"https://github.com/{GITHUB_REPO}/releases/latest"
-    return tag.lstrip("vV"), url, (data.get("body") or "").strip()
+    setup = next((a["browser_download_url"] for a in data.get("assets", [])
+                  if re.fullmatch(r"KatSetup.*\.exe", a.get("name", ""), re.I)), None)
+    return tag.lstrip("vV"), url, (data.get("body") or "").strip(), setup
 
 
 # ======================= ОКНО НАСТРОЕК =======================
@@ -1531,8 +1653,34 @@ class SettingsWindow:
                       2, 30, 1)
 
         # --- текст на экране ---
-        box = ttk.LabelFrame(frm, text="Текст на экране", padding=10)
+        # --- языки ---
+        box = ttk.LabelFrame(frm, text="Языки", padding=10)
         box.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        self.NO_EXTRA = "Нет — только английский"
+        self.lang_map = {self.NO_EXTRA: ""}
+        for code in sorted(LANGUAGES, key=LANGUAGES.get):
+            self.lang_map[LANGUAGES[code] + ("  ✓" if lang_downloaded(code) else "")] = code
+        current = next((k for k, c in self.lang_map.items() if c == EXTRA_LANG), self.NO_EXTRA)
+        ttk.Label(box, text="Ещё один язык собеседников\n(кроме английского):"
+                  ).grid(row=0, column=0, sticky="w", padx=(0, 10), pady=3)
+        self.extra_var = tk.StringVar(value=current)
+        ttk.Combobox(box, textvariable=self.extra_var, values=list(self.lang_map), width=28,
+                     state="readonly", height=15).grid(row=0, column=1, sticky="w", pady=3)
+        ttk.Label(box, text="Мою речь (F9) переводить на:"
+                  ).grid(row=1, column=0, sticky="w", padx=(0, 10), pady=3)
+        self.target_var = tk.StringVar(
+            value=lang_name(TARGET_LANG) if TARGET_LANG == EXTRA_LANG and EXTRA_LANG else "Английский")
+        self.target_box = ttk.Combobox(box, textvariable=self.target_var, width=28, state="readonly")
+        self.target_box.grid(row=1, column=1, sticky="w", pady=3)
+        ttk.Label(box, foreground="#666", justify="left",
+                  text="✓ — уже скачан. Новый язык скачается после «Применить» (~700 МБ).\n"
+                       "С русского и на русский переводится через английский."
+                  ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.extra_var.trace_add("write", lambda *_: self._update_targets())
+        self._update_targets()
+
+        box = ttk.LabelFrame(frm, text="Текст на экране", padding=10)
+        box.grid(row=3, column=0, sticky="ew", pady=(0, 10))
         ttk.Label(box, text="Прозрачность:").grid(row=0, column=0, sticky="w", pady=3)
         self.opacity = tk.DoubleVar(value=TEXT_OPACITY)
         ttk.Scale(box, from_=0.2, to=1.0, variable=self.opacity, length=220
@@ -1552,7 +1700,7 @@ class SettingsWindow:
 
         # --- запуск ---
         box = ttk.LabelFrame(frm, text="Запуск", padding=10)
-        box.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        box.grid(row=4, column=0, sticky="ew", pady=(0, 10))
         try:
             self.autostart_was = autostart_enabled()
         except Exception as e:
@@ -1575,7 +1723,7 @@ class SettingsWindow:
 
         # --- кнопки ---
         bar = ttk.Frame(frm)
-        bar.grid(row=4, column=0, sticky="ew")
+        bar.grid(row=5, column=0, sticky="ew")
         self.status = ttk.Label(bar, foreground="#2E7D32")
         self.status.pack(side="left")
         ttk.Button(bar, text="Применить", command=lambda: self.apply(False)).pack(side="right")
@@ -1596,6 +1744,14 @@ class SettingsWindow:
         self.win.deiconify()
         self.win.lift()
         self.win.focus_force()
+
+    def _update_targets(self):
+        """Список «переводить мою речь на»: английский + выбранный доп. язык."""
+        extra = self.lang_map.get(self.extra_var.get(), "")
+        values = ["Английский"] + ([lang_name(extra)] if extra else [])
+        self.target_box.config(values=values)
+        if self.target_var.get() not in values:
+            self.target_var.set("Английский")
 
     def _num_row(self, box, row, var_name, label, lo, hi, step):
         from tkinter import ttk
@@ -1709,6 +1865,15 @@ class SettingsWindow:
             return
 
         problems = []
+        extra = self.lang_map.get(self.extra_var.get(), "")
+        if extra and extra != EXTRA_LANG and not lang_downloaded(extra) and not messagebox.askyesno(
+                "Настройки", f"Скачать модели перевода для языка «{lang_name(extra)}»?\n\n"
+                             "Это около 700 МБ, займёт несколько минут. Kat продолжит работать, "
+                             "ход загрузки будет виден на экране.", parent=self.win):
+            extra = EXTRA_LANG  # отказались — язык не меняем
+            self.extra_var.set(next(k for k, c in self.lang_map.items() if c == extra))
+        target = "en" if not extra or self.target_var.get() == "Английский" else extra
+        extra_changed = extra != EXTRA_LANG
         mic = self.mic_map[self.mic_var.get()]
         out = self.out_map[self.out_var.get()]
         if not app.switch_mic(mic, problems):
@@ -1737,10 +1902,13 @@ class SettingsWindow:
 
         values = {**visual, **{k: globals()[k] for k in old_keys},
                   "MIC_DEVICE": mic, "LOOPBACK_DEVICE": out, "RUN_AS_ADMIN": want_admin,
-                  "CHECK_UPDATES": self.updates.get()}
+                  "CHECK_UPDATES": self.updates.get(),
+                  "EXTRA_LANG": extra, "TARGET_LANG": target}
         self.show_visual(values)
         self.saved_visual = {k: globals()[k] for k in self.VISUAL}
-        app.update_tray()  # в меню трея указана клавиша живого перевода
+        app.update_tray()
+        if extra_changed:
+            app.set_extra_language(extra)  # в меню трея указана клавиша живого перевода
         if app.state["loop"] is not None:
             app.state["loop"].set_seconds(THEM_SECONDS)
         try:
@@ -1785,7 +1953,7 @@ class App:
             "them": Overlay(tk.Toplevel(self.root), y_from_top=THEM_Y_FROM_TOP),
         }
         self.ui_q = queue.Queue()
-        self.state = {"model": None, "mt_en_ru": None, "mt_ru_en": None, "hints": None,
+        self.state = {"model": None, "mt": {}, "hints": None,
                       "rec": None, "loop": None, "busy_me": False, "busy_them": False,
                       "paused": False, "capturing": False, "live": LIVE}
         self.model_lock = threading.Lock()  # видеокарта считает одну фразу за раз
@@ -1794,6 +1962,7 @@ class App:
         self.them_hold_until = 0.0  # до этого момента на экране результат F10 — не перекрывать
         self.live_phrase_lang = None  # язык текущей фразы (определяется один раз на фразу)
         self.update_info = None  # (версия, ссылка, что нового), если на GitHub есть новее
+        self.glossary = None  # словарь glossary.txt — общий для всех моделей перевода
         self.settings_window = None
         self.tray = None
 
@@ -1857,24 +2026,37 @@ class App:
         global _download_hook
         st = self.state
         try:
+            try:
+                ensure_cuda_libs()
+            except Exception as e:
+                print(f"[!] Не удалось скачать библиотеки CUDA ({e}) — работаю на процессоре.")
             model, desc = load_whisper()
             st["hints"] = Hints(model.hf_tokenizer)
             st["hints"].get(SOURCE_LANG)  # прочитать words.txt и отчитаться в логе
             glossary = Glossary()
             glossary._safe_reload()  # создать glossary.txt и отчитаться в логе
-            if SOURCE_LANG == "ru":
+            self.glossary = glossary
+            if SOURCE_LANG != "en":
                 try:
-                    st["mt_ru_en"] = TextTranslator("quickmt-ru-en", glossary)
+                    self.load_mt(f"{SOURCE_LANG}-en")
                 except Exception as e:
-                    print(f"[!] Переводчик RU->EN не загрузился: {e}. "
+                    print(f"[!] Переводчик {SOURCE_LANG.upper()}->EN не загрузился: {e}. "
                           "Перевожу свою речь через Whisper (медленнее).")
             st["model"] = model
             try:
-                st["mt_en_ru"] = TextTranslator("quickmt-en-ru", glossary)
+                if SOURCE_LANG != "en":
+                    self.load_mt(f"en-{SOURCE_LANG}")
                 them_info = f", {THEM_HOTKEY.upper()} — перевести собеседника"
             except Exception as e:
-                print(f"[!] Переводчик EN->RU не загрузился: {e}")
+                print(f"[!] Переводчик EN->{SOURCE_LANG.upper()} не загрузился: {e}")
                 them_info = ""
+            if EXTRA_LANG in LANGUAGES:
+                try:
+                    for d in (f"{EXTRA_LANG}-en", f"en-{EXTRA_LANG}"):
+                        self.load_mt(d)
+                    print(f"Дополнительный язык: {lang_name(EXTRA_LANG)}")
+                except Exception as e:
+                    print(f"[!] Модели для языка {lang_name(EXTRA_LANG)} не загрузились: {e}")
             print(f"Готово ({desc}). Держи {HOTKEY.upper()} и говори{them_info}, "
                   f"{LIVE_HOTKEY.upper()} — живой перевод. "
                   f"Выход: {EXIT_HOTKEY} или через иконку в трее.")
@@ -1973,6 +2155,82 @@ class App:
         with self.model_lock:
             return mt(text)
 
+    # ---------- языки ----------
+    def load_mt(self, direction):
+        """Загрузить модель перевода quickmt-<direction> (скачать, если её нет)."""
+        if direction not in self.state["mt"]:
+            self.state["mt"][direction] = TextTranslator(f"quickmt-{direction}", self.glossary)
+
+    @staticmethod
+    def _chain(src, dst):
+        """Шаги перевода: напрямую, если одна из сторон английский, иначе через него."""
+        path = [src, dst] if "en" in (src, dst) else [src, "en", dst]
+        return [f"{a}-{b}" for a, b in zip(path, path[1:])]
+
+    def has_chain(self, src, dst):
+        return src == dst or all(d in self.state["mt"] for d in self._chain(src, dst))
+
+    def translate_chain(self, text, src, dst):
+        if src == dst or not text:
+            return text
+        for d in self._chain(src, dst):
+            text = self.translate(self.state["mt"][d], text)
+        return text
+
+    def them_langs(self):
+        """На каких языках могут говорить собеседники (для определения языка):
+        английский, дополнительный (если его модели готовы) и мой собственный."""
+        langs = ["en"]
+        if EXTRA_LANG in LANGUAGES and self.has_chain(EXTRA_LANG, SOURCE_LANG):
+            langs.append(EXTRA_LANG)
+        if SOURCE_LANG not in langs:
+            langs.append(SOURCE_LANG)
+        return langs
+
+    def them_lang(self, audio):
+        langs = self.them_langs()
+        return langs[0] if len(langs) == 1 else self.detect_lang(audio, tuple(langs))
+
+    def them_ready(self):
+        return self.state["model"] is not None and self.has_chain("en", SOURCE_LANG)
+
+    def my_target(self):
+        """Язык перевода моей речи: выбранный, если его модели готовы, иначе английский."""
+        t = TARGET_LANG
+        if t != "en" and t == EXTRA_LANG and self.has_chain(SOURCE_LANG, t):
+            return t
+        return "en"
+
+    def set_extra_language(self, code):
+        """Сменить дополнительный язык (из окна настроек): старые модели выгрузить,
+        новые — скачать и загрузить в фоне."""
+        mt = self.state["mt"]
+        for d in list(mt):
+            if any(c not in ("en", SOURCE_LANG, code) for c in d.split("-")):
+                del mt[d]
+        if code:
+            threading.Thread(target=self._install_language, args=(code,),
+                             daemon=True, name="language").start()
+
+    def _install_language(self, code):
+        global _download_hook
+        if self.state["model"] is None:  # модели ещё грузятся — язык подхватит loader
+            return
+        name = lang_name(code)
+        self.show("me", f"{name}: загружаю модели перевода...")
+        _download_hook = lambda text: self.show("me", f"{name}: {text}")  # noqa: E731
+        try:
+            for d in (f"{code}-en", f"en-{code}"):
+                self.load_mt(d)
+            print(f"Дополнительный язык: {name} — готово")
+            self.show("me", f"{name}: готово! Собеседников на этом языке Kat теперь переводит", 5)
+        except Exception as e:
+            traceback.print_exc()
+            self.show("me", f"{name}: не удалось скачать модели ({e}).\n"
+                            "Проверьте интернет и выберите язык в настройках ещё раз", 10)
+        finally:
+            _download_hook = None
+
     @staticmethod
     def normalize(audio):
         peak = float(np.abs(audio).max()) if len(audio) else 0.0
@@ -1996,13 +2254,14 @@ class App:
                 print("[!] Микрофон пишет тишину. Выберите другой микрофон в настройках.")
                 self.show("me", "Микрофон молчит — выберите другой в настройках", 4)
                 return
-            mt = st["mt_ru_en"]
+            target = self.my_target()
             t0 = time.perf_counter()
-            if mt is not None:
+            if SOURCE_LANG != "en" and self.has_chain(SOURCE_LANG, target):
                 # быстрый путь: Whisper распознаёт один раз, перевод — отдельной моделью
+                # (на дополнительный язык — через английский)
                 ru = self.transcribe(audio, SOURCE_LANG, "transcribe")
                 t1 = time.perf_counter()
-                en = self.translate(mt, ru) if ru else ""
+                en = self.translate_chain(ru, SOURCE_LANG, target) if ru else ""
             else:
                 # запасной путь (нет quickmt-ru-en или язык не русский): перевод Whisper'ом
                 en = self.transcribe(audio, SOURCE_LANG, "translate")
@@ -2053,18 +2312,18 @@ class App:
             t0 = time.perf_counter()
             # собеседники бывают и русскоязычные: такую речь показываем как есть,
             # а не прогоняем через перевод EN->RU (он её только портит)
-            lang = "en" if SOURCE_LANG == "en" else self.detect_lang(audio, ("en", SOURCE_LANG))
+            lang = self.them_lang(audio)
             heard = self.transcribe(audio, lang, "transcribe")
             t1 = time.perf_counter()
-            if lang == "en":
-                ru = self.translate(self.state["mt_en_ru"], heard) if heard else ""
+            if lang != SOURCE_LANG:
+                ru = self.translate_chain(heard, lang, SOURCE_LANG)
             t2 = time.perf_counter()
             print(f"[собеседник] язык {lang}, время: распознавание {t1 - t0:.2f} с"
                   f" + перевод {t2 - t1:.2f} с = {t2 - t0:.2f} с")
             if not heard:
                 self.show("them", "(речи не слышно)", 2)
                 return
-            if lang != "en":
+            if lang == SOURCE_LANG:
                 text = heard  # уже на моём языке
             else:
                 text = f"{ru}\n{heard}" if SHOW_ORIGINAL else ru
@@ -2079,7 +2338,7 @@ class App:
 
     def on_them(self, _):
         st = self.state
-        if st["loop"] is None or st["model"] is None or st["mt_en_ru"] is None \
+        if st["loop"] is None or not self.them_ready() \
                 or st["busy_them"] or st["paused"] or st["capturing"]:
             return
         st["busy_them"] = True
@@ -2148,7 +2407,7 @@ class App:
         while True:
             try:
                 loop = st["loop"]
-                ready = st["model"] is not None and st["mt_en_ru"] is not None
+                ready = self.them_ready()
                 if not st["live"] or st["paused"] or loop is None or not ready:
                     detach()
                     attached, pending = None, pending[:0]
@@ -2206,18 +2465,16 @@ class App:
         t0 = time.perf_counter()
         # язык определяем на первом черновике и на всей фразе в конце (так надёжнее)
         lang = self.live_phrase_lang
-        if SOURCE_LANG == "en":
-            lang = "en"
-        elif final or lang is None:
-            lang = self.detect_lang(audio, ("en", SOURCE_LANG))
+        if final or lang is None:
+            lang = self.them_lang(audio)
         self.live_phrase_lang = None if final else lang
-        if lang != "en":
+        if lang == SOURCE_LANG:
             # речь уже на моём языке (русскоязычные собеседники) — переводить нечего
             if final:
                 print(f"[живой] {len(audio) / SAMPLE_RATE:.1f} с, язык {lang} — пропускаю")
                 self.show_live(None, final=True)  # убрать черновик, если он был
             return
-        heard = self.transcribe(audio, "en", "transcribe", beam=5 if final else 1)
+        heard = self.transcribe(audio, lang, "transcribe", beam=5 if final else 1)
         if not st["live"] or st["paused"]:
             return
         if not heard:
@@ -2225,7 +2482,7 @@ class App:
                 self.show_live(None, final=True)
             return
         t1 = time.perf_counter()
-        ru = self.translate(st["mt_en_ru"], heard)
+        ru = self.translate_chain(heard, lang, SOURCE_LANG)
         t2 = time.perf_counter()
         if final:
             print(f"[живой] {len(audio) / SAMPLE_RATE:.1f} с, распознавание {t1 - t0:.2f} с"
@@ -2297,19 +2554,57 @@ class App:
         if info is None:
             print(f"[i] Обновлений нет: {APP_NAME} {APP_VERSION} — последняя версия.")
             return
-        version, url, notes = info
+        version, url, notes, _setup = info
         self.update_info = info
         print(f"[обновление] Вышла версия {version} (у вас {APP_VERSION}): {url}")
         if notes:
             print("[обновление] Что нового:\n" + notes)
         self.call_in_ui(self.update_tray)
+        how = "Обновить" if self.can_self_update() else "Скачать"
         self.show("me", f"Вышла новая версия {APP_NAME} {version}!\n"
-                        "Скачать — в меню иконки в трее", 10)
+                        f"{how} — в меню иконки в трее", 10)
+
+    def can_self_update(self):
+        """Обновиться сами можем только установленной версией (Kat.exe) и если в релизе
+        есть установщик; из исходников — только открыть страницу релиза."""
+        return FROZEN and self.update_info is not None and self.update_info[3] is not None
 
     def open_update_page(self):
         import webbrowser
-        if self.update_info is not None:
+        if self.update_info is None:
+            return
+        if self.can_self_update():
+            if not ask_yes_no(f"Обновить {APP_NAME} до версии {self.update_info[0]}?\n\n"
+                              "Kat скачает установщик, закроется на минуту и запустится "
+                              "уже новым. Настройки и модели сохранятся."):
+                return
+            threading.Thread(target=self._self_update, daemon=True, name="self-update").start()
+        else:
             webbrowser.open(self.update_info[1])
+
+    def _self_update(self):
+        """Скачать KatSetup.exe из релиза и запустить его тихо; он закроет Kat,
+        обновит файлы и запустит новую версию."""
+        import tempfile
+        global _download_hook
+        version, _url, _notes, setup_url = self.update_info
+        dest = os.path.join(tempfile.gettempdir(), f"KatSetup-{version}.exe")
+        _download_hook = lambda text: self.show("me", f"Обновление: {text}")  # noqa: E731
+        try:
+            if os.path.exists(dest):
+                os.remove(dest)
+            if not download_file(setup_url, dest):
+                raise RuntimeError("установщик не найден в релизе")
+            print(f"[обновление] запускаю {dest}")
+            self.show("me", f"Устанавливаю {APP_NAME} {version}...", 30)
+            subprocess.Popen([dest, "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
+                              f"/DIR={BASE_DIR}"], close_fds=True)
+            self.ui_q.put(("quit",))
+        except Exception as e:
+            traceback.print_exc()
+            self.show("me", f"Не удалось обновиться: {e}", 8)
+        finally:
+            _download_hook = None
 
     # ---------- трей ----------
     def start_tray(self):
@@ -2320,8 +2615,9 @@ class App:
             return
         item = pystray.MenuItem
         menu = pystray.Menu(
-            item(lambda _: f"⬇ Скачать обновление {self.update_info[0]}" if self.update_info
-                 else "", lambda: self.open_update_page(),
+            item(lambda _: (f"⬇ {'Обновить до' if self.can_self_update() else 'Скачать обновление'}"
+                            f" {self.update_info[0]}") if self.update_info else "",
+                 lambda: self.call_in_ui(self.open_update_page),
                  visible=lambda _: self.update_info is not None),
             item("Настройки", lambda: self.call_in_ui(self.open_settings), default=True),
             item(lambda _: f"Живой перевод ({LIVE_HOTKEY.upper()})",
@@ -2391,10 +2687,46 @@ class App:
         self.root.destroy()
 
 
+def selftest(args):
+    """Kat.exe --selftest [файл.wav]: проверка сборки — всё ли внутри грузится и работает.
+    Пишет в log.txt и заканчивается строкой «SELFTEST OK». Окон и горячих клавиш не трогает."""
+    import wave
+    import pystray  # noqa: F401  (трей)
+    import pyaudiowpatch  # noqa: F401  (звук собеседников)
+    print(f"selftest: {APP_NAME} {APP_VERSION}, frozen={FROZEN}, папка {BASE_DIR}")
+    root = tk.Tk()
+    root.withdraw()
+    root.destroy()
+    print("selftest: tkinter ok; микрофонов:", sum(1 for d in sd.query_devices()
+                                                  if d["max_input_channels"] > 0))
+    ensure_cuda_libs()
+    model, desc = load_whisper()
+    print(f"selftest: whisper ok ({desc})")
+    from faster_whisper.vad import get_speech_timestamps
+    get_speech_timestamps(np.zeros(SAMPLE_RATE, dtype=np.float32))
+    print("selftest: vad ok")
+    glossary = Glossary()
+    for d, text in (("en-ru", "Can you heal me? I'm almost dead."),
+                    ("ru-en", "Иди на левую сторону, там босс.")):
+        print(f"selftest: {d}: {text} -> {TextTranslator(f'quickmt-{d}', glossary)(text)}")
+    for path in (a for a in args if a.lower().endswith(".wav")):
+        with wave.open(path) as w:
+            sr, ch = w.getframerate(), w.getnchannels()
+            a = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32)
+        a = to_16k(a.reshape(-1, ch).mean(axis=1) / 32768.0, sr)
+        segs, info = model.transcribe(a, vad_filter=True)
+        print(f"selftest: {os.path.basename(path)} [{info.language}]:",
+              " ".join(x.text.strip() for x in segs))
+    print("SELFTEST OK")
+
+
 def main():
     args = sys.argv[1:]
     if "--setup" in args:  # вызывает start.bat после установки
         create_shortcuts()
+        return
+    if "--selftest" in args:
+        selftest(args)
         return
     if os.name == "nt":
         if requirements_changed():

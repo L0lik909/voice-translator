@@ -20,3 +20,10 @@ _battest/
 
 # Служебные папки инструментов
 .serena/
+
+# Сборка установщика
+.build-venv/
+build/
+dist/
+_frozentest/
+installer/Kat.ico
