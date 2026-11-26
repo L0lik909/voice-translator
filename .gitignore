@@ -27,3 +27,4 @@ build/
 dist/
 _frozentest/
 installer/Kat.ico
+_installtest/

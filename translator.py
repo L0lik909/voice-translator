@@ -35,7 +35,7 @@ import collections
 import configparser
 
 APP_NAME = "Kat"
-APP_VERSION = "1.2.0"  # менять при каждом обновлении + запись в CHANGELOG.md
+APP_VERSION = "1.3.0"  # менять при каждом обновлении + запись в CHANGELOG.md
 OLD_APP_NAMES = ("Голосовой переводчик",)  # прежние названия — их ярлыки заменяем новыми
 # FROZEN — запущены как Kat.exe из установщика (PyInstaller), а не как translator.py
 FROZEN = bool(getattr(sys, "frozen", False))
@@ -2597,7 +2597,7 @@ class App:
                 raise RuntimeError("установщик не найден в релизе")
             print(f"[обновление] запускаю {dest}")
             self.show("me", f"Устанавливаю {APP_NAME} {version}...", 30)
-            subprocess.Popen([dest, "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
+            subprocess.Popen([dest, "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LAUNCH=1",
                               f"/DIR={BASE_DIR}"], close_fds=True)
             self.ui_q.put(("quit",))
         except Exception as e:
