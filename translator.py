@@ -37,7 +37,7 @@ import configparser
 
 APP_NAME = "Kat"
 APP_AUTHOR = "L0lik"
-APP_VERSION = "1.5.0"  # менять при каждом обновлении + запись в CHANGELOG.md
+APP_VERSION = "1.5.1"  # менять при каждом обновлении + запись в CHANGELOG.md
 OLD_APP_NAMES = ("Голосовой переводчик",)  # прежние названия — их ярлыки заменяем новыми
 # FROZEN — запущены как Kat.exe из установщика (PyInstaller), а не как translator.py
 FROZEN = bool(getattr(sys, "frozen", False))
