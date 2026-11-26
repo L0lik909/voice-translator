@@ -29,6 +29,7 @@ import queue
 import ctypes
 import hashlib
 import threading
+import shutil
 import traceback
 import subprocess
 import collections
@@ -36,7 +37,7 @@ import configparser
 
 APP_NAME = "Kat"
 APP_AUTHOR = "L0lik"
-APP_VERSION = "1.3.1"  # менять при каждом обновлении + запись в CHANGELOG.md
+APP_VERSION = "1.4.0"  # менять при каждом обновлении + запись в CHANGELOG.md
 OLD_APP_NAMES = ("Голосовой переводчик",)  # прежние названия — их ярлыки заменяем новыми
 # FROZEN — запущены как Kat.exe из установщика (PyInstaller), а не как translator.py
 FROZEN = bool(getattr(sys, "frozen", False))
@@ -217,7 +218,7 @@ font_size = 22
 font_bold = да
 
 ; Прозрачность текста: 1.0 = непрозрачный, 0.3 = еле видно.
-text_opacity = 0.6
+text_opacity = 0.95
 
 ; Цвета в формате #RRGGBB.
 ; Мой перевод:
@@ -226,8 +227,11 @@ text_color = #FFFFFF
 them_color = #80D8FF
 ; Служебные сообщения («Слушаю...», «Перевожу...»):
 status_color = #FFD54F
-; Обводка текста:
+; Тень и обводка текста:
 outline_color = #000000
+; Плашка (фон) под текстом и её прозрачность: 0 = без плашки, 1 = непрозрачная.
+panel_color = #15111D
+panel_opacity = 0.55
 
 ; Мой перевод: отступ от низа экрана (в пикселях).
 y_from_bottom = 230
@@ -276,6 +280,8 @@ SPEC = [
     ("THEM_COLOR", "внешний_вид", "them_color", "str"),
     ("STATUS_COLOR", "внешний_вид", "status_color", "str"),
     ("OUTLINE_COLOR", "внешний_вид", "outline_color", "str"),
+    ("PANEL_COLOR", "внешний_вид", "panel_color", "str"),
+    ("PANEL_OPACITY", "внешний_вид", "panel_opacity", "float"),
     ("Y_FROM_BOTTOM", "внешний_вид", "y_from_bottom", "int"),
     ("THEM_Y_FROM_TOP", "внешний_вид", "them_y_from_top", "int"),
     ("MIN_SECONDS", "внешний_вид", "min_seconds", "float"),
@@ -385,7 +391,89 @@ def save_settings(values):
     os.replace(tmp, SETTINGS_FILE)
 
 
+def _link_or_copy(src, dst):
+    """Жёсткая ссылка (мгновенно и без лишнего места), а если нельзя — копия."""
+    if os.path.exists(dst):
+        return
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
+
+MIGRATED_FROM = None  # папка прежней копии, если только что из неё всё перенесли
+
+
+def migrate_old_install():
+    """Kat.exe, первый запуск после установки: установщик нашёл прежнюю копию Kat
+    (из исходников, по ярлыку) и оставил её путь в migrate_from.txt. Переносим настройки
+    (микрофон, наушники, клавиши...), словари и уже скачанные модели и библиотеки CUDA —
+    чтобы ничего не сбилось и не качалось заново."""
+    mark = os.path.join(BASE_DIR, "migrate_from.txt")
+    if not FROZEN or not os.path.exists(mark):
+        return
+    try:
+        with open(mark, encoding="utf-8-sig") as f:
+            old = f.read().strip()
+        os.remove(mark)
+        if not os.path.isdir(old) or os.path.normcase(os.path.abspath(old)) == os.path.normcase(BASE_DIR):
+            return
+        print(f"Переношу настройки и модели из прежней версии: {old}")
+        global MIGRATED_FROM
+        MIGRATED_FROM = old
+        for name in ("settings.ini", "words.txt", "glossary.txt"):
+            src = os.path.join(old, name)
+            if os.path.exists(src):
+                shutil.copy2(src, os.path.join(BASE_DIR, name))
+                print(f"  перенесён {name}")
+        old_models = os.path.join(old, "models")
+        n = 0
+        for dirpath, _, files in os.walk(old_models):
+            for fname in files:
+                if fname.endswith(".part"):
+                    continue
+                src = os.path.join(dirpath, fname)
+                _link_or_copy(src, os.path.join(MODELS_DIR, os.path.relpath(src, old_models)))
+                n += 1
+        if n:
+            print(f"  перенесены модели ({n} файлов)")
+        dlls = [d for d in glob.glob(os.path.join(old, "venv", "Lib", "site-packages", "nvidia",
+                                                    "*", "bin", "*.dll"))
+                if not os.path.basename(d).lower().startswith("nvblas")]
+        if dlls and not os.path.exists(os.path.join(CUDA_DIR, "ok.txt")):
+            for d in dlls:
+                _link_or_copy(d, os.path.join(CUDA_DIR, os.path.basename(d)))
+            with open(os.path.join(CUDA_DIR, "ok.txt"), "w", encoding="utf-8") as f:
+                f.write(f"перенесено из {old}")
+            print(f"  перенесены библиотеки видеокарты ({len(dlls)} файлов)")
+    except Exception as e:
+        print(f"[!] Не удалось перенести данные прежней версии: {e}")
+
+
+def upgrade_look():
+    """1.4.0: текст рисуется на плашке, и старая прозрачность по умолчанию (0.6 —
+    она делала полупрозрачным всё окно) теперь только бледнит буквы. Если её не меняли
+    и в настройках ещё нет плашки — ставим новое значение по умолчанию."""
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8-sig") as f:
+            if "panel_opacity" in f.read():
+                return
+    except OSError:
+        return
+    if abs(TEXT_OPACITY - 0.6) < 1e-6:
+        set_settings({"TEXT_OPACITY": 0.95})
+        print("[вид] прозрачность текста 0.6 -> 0.95 (теперь у текста своя плашка)")
+    try:
+        save_settings({k: globals()[k] for k in ("TEXT_OPACITY", "PANEL_COLOR", "PANEL_OPACITY")})
+    except OSError:
+        pass
+
+
+MODELS_DIR = os.path.join(BASE_DIR, "models")
+migrate_old_install()
 set_settings(load_settings())
+upgrade_look()
 # =========================================================
 
 
@@ -429,6 +517,7 @@ ENDPOINTS = ["https://huggingface.co", "https://hf-mirror.com"]  # основн�
 # ======================= ЗАГРУЗКА МОДЕЛЕЙ =======================
 
 _download_hook = None  # функция(текст): показать ход загрузки на экране
+_progress_hook = None  # функция(скачано, всего): для полосы загрузки в окне обновления
 
 
 def download_file(url, dest):
@@ -471,6 +560,8 @@ def download_file(url, dest):
                 f.write(chunk)
                 done += len(chunk)
                 bar.update(len(chunk))
+                if _progress_hook:
+                    _progress_hook(done, total)
                 if _download_hook and time.monotonic() - shown > 1:
                     shown = time.monotonic()
                     pct = f"{done / total:.0%}" if total else f"{done / 2**20:.0f} МБ"
@@ -1225,6 +1316,8 @@ class Overlay:
         c.create_text(cx, cy, fill=color, **opts)
 
     def show(self, text, timeout=None, color=None):
+        if isinstance(text, list):  # [(перевод, оригинал)] — как у LayeredOverlay
+            text = "\n\n".join(m + (f"\n{o}" if o else "") for m, o in text)
         self.current = (text, color or TEXT_COLOR)
         # сначала поверх всех, потом рисуем: -topmost после смены геометрии
         # возвращает окно на прежнее место
@@ -1243,6 +1336,298 @@ class Overlay:
         if self.hide_job:
             self.win.after_cancel(self.hide_job)
         self.hide_job = None
+
+
+# ======================= КРАСИВЫЙ ТЕКСТ =======================
+# Текст рисуется картинкой (Pillow) с настоящей полупрозрачностью: плашка, мягкая тень,
+# сглаженные буквы — и выводится в «слоёное» окно Windows (UpdateLayeredWindow).
+
+_FONT_FILES = None
+_font_cache = {}
+
+
+def _font_file(name, bold):
+    """Файл шрифта по названию из Windows: «Segoe UI» + жирный -> segoeuib.ttf."""
+    global _FONT_FILES
+    if _FONT_FILES is None:
+        _FONT_FILES = {}
+        import winreg
+        key = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"
+        for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            try:
+                with winreg.OpenKey(root, key) as k:
+                    i = 0
+                    while True:
+                        try:
+                            n, v, _ = winreg.EnumValue(k, i)
+                        except OSError:
+                            break
+                        i += 1
+                        n = re.sub(r"\s*\((TrueType|OpenType)\)$", "", n).strip().lower()
+                        _FONT_FILES.setdefault(n, v)
+            except OSError:
+                pass
+    base = name.strip().lower()
+    for cand in ([base + " bold", base + " semibold", base] if bold else [base, base + " regular"]):
+        if cand in _FONT_FILES:
+            return _FONT_FILES[cand]
+    return "segoeuib.ttf" if bold else "segoeui.ttf"
+
+
+def get_font(px, bold):
+    from PIL import ImageFont
+    key = (FONT_NAME, px, bold)
+    if key not in _font_cache:
+        font = None
+        for f in (_font_file(FONT_NAME, bold), "segoeuib.ttf" if bold else "segoeui.ttf", "arial.ttf"):
+            try:
+                font = ImageFont.truetype(f, px)
+                break
+            except OSError:
+                continue
+        _font_cache[key] = font or ImageFont.load_default()
+    return _font_cache[key]
+
+
+def _rgb(hex_color, default=(255, 255, 255)):
+    h = str(hex_color).strip().lstrip("#")
+    try:
+        return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4)) if len(h) == 6 else default
+    except ValueError:
+        return default
+
+
+def _wrap(text, font, width):
+    """Перенос по словам; слишком длинное слово (или текст без пробелов, как
+    китайский) режется по буквам."""
+    lines, cur = [], ""
+    for w in text.split(" "):
+        t = f"{cur} {w}" if cur else w
+        if not cur or font.getlength(t) <= width:
+            cur = t
+        else:
+            lines.append(cur)
+            cur = w
+    lines.append(cur)
+    out = []
+    for line in lines:
+        while len(line) > 1 and font.getlength(line) > width:
+            lo, hi = 1, len(line)
+            while lo < hi:  # сколько букв влезает
+                mid = (lo + hi + 1) // 2
+                if font.getlength(line[:mid]) <= width:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            out.append(line[:lo])
+            line = line[lo:]
+        out.append(line)
+    return out
+
+
+def render_text_image(entries, color, px_per_pt, max_width):
+    """entries: [(главный текст, оригинал или None)]. Возвращает (картинка RGBA, поля)."""
+    from PIL import Image, ImageDraw, ImageFilter
+    main_px = max(8, round(FONT_SIZE * px_per_pt))
+    sub_px = max(8, round(main_px * 0.72))
+    fm, fs = get_font(main_px, FONT_BOLD), get_font(sub_px, False)
+    pad_x, pad_y = round(main_px * 0.9), round(main_px * 0.5)
+    margin = round(main_px * 0.7)  # место для тени вокруг плашки
+    inner = max(100, max_width - 2 * (pad_x + margin))
+    rows = []  # (текст, шрифт, это оригинал?) или None — промежуток между фразами
+    for i, (main, sub) in enumerate(entries):
+        if i:
+            rows.append(None)
+        for para in str(main).split("\n"):
+            rows += [(t, fm, False) for t in _wrap(para, fm, inner)]
+        if sub:
+            for para in str(sub).split("\n"):
+                rows += [(t, fs, True) for t in _wrap(para, fs, inner)]
+
+    def line_h(font):
+        a, d = font.getmetrics()
+        return round((a + d) * 1.12)
+
+    heights = [round(main_px * 0.5) if row is None else line_h(row[1]) for row in rows]
+    text_w = max([row[1].getlength(row[0]) for row in rows if row] + [1])
+    w, h = int(text_w + 2 * pad_x), int(sum(heights) + 2 * pad_y)
+    size = (w + 2 * margin, h + 2 * margin)
+    img = Image.new("RGBA", size, (0, 0, 0, 0))
+    panel_a = max(0.0, min(1.0, PANEL_OPACITY))
+    text_a = max(0.05, min(1.0, TEXT_OPACITY))
+    main_rgb, shade = _rgb(color), _rgb(OUTLINE_COLOR, (0, 0, 0))
+    box = (margin, margin, margin + w, margin + h)
+    radius = round(main_px * 0.55)
+
+    if panel_a > 0.01:
+        # мягкая тень под плашкой, сама плашка и тонкая рамка цвета текста
+        sh = Image.new("L", size, 0)
+        dy = round(main_px * 0.15)
+        ImageDraw.Draw(sh).rounded_rectangle((box[0], box[1] + dy, box[2], box[3] + dy), radius,
+                                             fill=int(120 * panel_a))
+        layer = Image.new("RGBA", size, (0, 0, 0, 255))
+        layer.putalpha(sh.filter(ImageFilter.GaussianBlur(main_px * 0.35)))
+        img = Image.alpha_composite(img, layer)
+        panel = Image.new("RGBA", size, (0, 0, 0, 0))
+        ImageDraw.Draw(panel).rounded_rectangle(
+            box, radius, fill=_rgb(PANEL_COLOR, (21, 17, 29)) + (int(255 * panel_a),),
+            outline=main_rgb + (int(90 * min(1.0, panel_a + 0.3)),), width=max(1, main_px // 16))
+        img = Image.alpha_composite(img, panel)
+
+    text = Image.new("RGBA", size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(text)
+    # без плашки буквам нужен контур, иначе их не видно на светлой игре
+    stroke = 0 if panel_a >= 0.35 else max(1, round(main_px * 0.07))
+    y, cx = margin + pad_y, size[0] / 2
+    for row, rh in zip(rows, heights):
+        if row:
+            t, font, sub = row
+            a = int(255 * text_a * (0.72 if sub else 1.0))
+            d.text((cx, y + rh / 2), t, font=font, anchor="mm", fill=main_rgb + (a,),
+                   stroke_width=stroke, stroke_fill=shade + (a,))
+        y += rh
+    # мягкая тень под буквами
+    glow = text.split()[3].filter(ImageFilter.GaussianBlur(max(1.0, main_px * 0.07)))
+    layer = Image.new("RGBA", size, shade + (0,))
+    layer.putalpha(glow.point(lambda v: int(v * 0.85)))
+    shifted = Image.new("RGBA", size, (0, 0, 0, 0))
+    shifted.paste(layer, (0, max(1, round(main_px * 0.06))))
+    img = Image.alpha_composite(img, shifted)
+    return Image.alpha_composite(img, text), margin
+
+
+class _BLEND(ctypes.Structure):
+    _fields_ = [("BlendOp", ctypes.c_ubyte), ("BlendFlags", ctypes.c_ubyte),
+                ("SourceConstantAlpha", ctypes.c_ubyte), ("AlphaFormat", ctypes.c_ubyte)]
+
+
+class _BMIH(ctypes.Structure):
+    _fields_ = [("biSize", ctypes.c_uint32), ("biWidth", ctypes.c_int32),
+                ("biHeight", ctypes.c_int32), ("biPlanes", ctypes.c_uint16),
+                ("biBitCount", ctypes.c_uint16), ("biCompression", ctypes.c_uint32),
+                ("biSizeImage", ctypes.c_uint32), ("biXPelsPerMeter", ctypes.c_int32),
+                ("biYPelsPerMeter", ctypes.c_int32), ("biClrUsed", ctypes.c_uint32),
+                ("biClrImportant", ctypes.c_uint32)]
+
+
+class _PT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+_gdi = None
+
+
+def _gdi_funcs():
+    """user32/gdi32 с правильными типами (на 64-битной Windows дескрипторы — указатели)."""
+    global _gdi
+    if _gdi is None:
+        u, g = ctypes.WinDLL("user32"), ctypes.WinDLL("gdi32")
+        vp, P = ctypes.c_void_p, ctypes.POINTER
+        u.GetDC.argtypes, u.GetDC.restype = [vp], vp
+        u.ReleaseDC.argtypes = [vp, vp]
+        u.GetParent.argtypes, u.GetParent.restype = [vp], vp
+        u.UpdateLayeredWindow.argtypes = [vp, vp, P(_PT), P(_PT), vp, P(_PT), ctypes.c_uint32,
+                                          P(_BLEND), ctypes.c_uint32]
+        u.UpdateLayeredWindow.restype = ctypes.c_int
+        g.CreateCompatibleDC.argtypes, g.CreateCompatibleDC.restype = [vp], vp
+        g.CreateDIBSection.argtypes = [vp, P(_BMIH), ctypes.c_uint, P(vp), vp, ctypes.c_uint32]
+        g.CreateDIBSection.restype = vp
+        g.SelectObject.argtypes, g.SelectObject.restype = [vp, vp], vp
+        g.DeleteObject.argtypes = [vp]
+        g.DeleteDC.argtypes = [vp]
+        _gdi = (u, g)
+    return _gdi
+
+
+class LayeredOverlay:
+    """Текст поверх игры: картинка с полупрозрачностью, клики проходят насквозь."""
+
+    def __init__(self, win, y_from_top=None, y_from_bottom=None):
+        self.win = win
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.geometry("1x1+0+0")
+        win.update_idletasks()
+        make_click_through(win)
+        user32, _ = _gdi_funcs()
+        self.hwnd = user32.GetParent(win.winfo_id())
+        self.current = None  # (фразы, цвет), что сейчас на экране
+        self.hide_job = None
+        self.anchor = (y_from_top, y_from_bottom)
+        self._blank()  # заодно проверка: если слоёные окна не работают — будет исключение
+
+    def place(self, y_from_top=None, y_from_bottom=None):
+        if y_from_top is not None or y_from_bottom is not None:
+            self.anchor = (y_from_top, y_from_bottom)
+        if self.current:
+            self._draw(*self.current)
+
+    def _draw(self, entries, color):
+        sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
+        img, m = render_text_image(entries, color, self.win.winfo_fpixels("1p"), int(sw * 0.8))
+        w, h = img.size
+        top, bottom = self.anchor
+        y = top - m if top is not None else sh - bottom - h + m
+        self._blit(img, (sw - w) // 2, max(0, min(y, sh - h)))
+
+    def _blank(self):
+        from PIL import Image
+        self._blit(Image.new("RGBA", (1, 1), (0, 0, 0, 0)), 0, 0)
+
+    def _blit(self, img, x, y):
+        user32, gdi32 = _gdi_funcs()
+        w, h = img.size
+        self.win.geometry(f"{w}x{h}+{x}+{y}")
+        a = np.asarray(img, dtype=np.uint8)
+        alpha = a[..., 3:4].astype(np.uint16)
+        rgb = (a[..., :3].astype(np.uint16) * alpha + 127) // 255  # Windows ждёт premultiplied
+        bgra = np.ascontiguousarray(np.dstack([rgb[..., 2], rgb[..., 1], rgb[..., 0],
+                                               a[..., 3]]).astype(np.uint8))
+        screen = user32.GetDC(None)
+        mem = gdi32.CreateCompatibleDC(screen)
+        bmi = _BMIH(ctypes.sizeof(_BMIH), w, -h, 1, 32, 0, 0, 0, 0, 0, 0)
+        bits = ctypes.c_void_p()
+        bmp = gdi32.CreateDIBSection(mem, ctypes.byref(bmi), 0, ctypes.byref(bits), None, 0)
+        try:
+            ctypes.memmove(bits, bgra.ctypes.data, w * h * 4)
+            old = gdi32.SelectObject(mem, bmp)
+            ok = user32.UpdateLayeredWindow(self.hwnd, screen, ctypes.byref(_PT(x, y)),
+                                            ctypes.byref(_PT(w, h)), mem, ctypes.byref(_PT(0, 0)),
+                                            0, ctypes.byref(_BLEND(0, 0, 255, 1)), 2)
+            gdi32.SelectObject(mem, old)
+        finally:
+            gdi32.DeleteObject(bmp)
+            gdi32.DeleteDC(mem)
+            user32.ReleaseDC(None, screen)
+        if not ok:
+            raise OSError("UpdateLayeredWindow не сработал")
+
+    def show(self, text, timeout=None, color=None):
+        entries = text if isinstance(text, list) else [(text, None)]
+        self.current = (entries, color or TEXT_COLOR)
+        self.win.attributes("-topmost", True)
+        self.win.lift()
+        self._draw(*self.current)
+        if self.hide_job:
+            self.win.after_cancel(self.hide_job)
+            self.hide_job = None
+        if timeout:
+            self.hide_job = self.win.after(int(timeout * 1000), self.hide)
+
+    def hide(self):
+        self.current = None
+        if self.hide_job:
+            self.win.after_cancel(self.hide_job)
+        self.hide_job = None
+        self._blank()
+
+
+def make_overlay(win, **anchor):
+    try:
+        return LayeredOverlay(win, **anchor)
+    except Exception as e:
+        print(f"[!] Красивый текст недоступен ({e}) — показываю обычным способом.")
+        return Overlay(win, **anchor)
 
 
 # ======================= ТРЕЙ =======================
@@ -1594,7 +1979,13 @@ class SettingsWindow:
     """
 
     VISUAL = ("TEXT_OPACITY", "FONT_SIZE", "DISPLAY_SECONDS", "Y_FROM_BOTTOM", "THEM_Y_FROM_TOP",
-              "THEM_SECONDS")
+              "THEM_SECONDS", "PANEL_OPACITY", "TEXT_COLOR", "THEM_COLOR", "STATUS_COLOR",
+              "PANEL_COLOR", "OUTLINE_COLOR")
+    COLORS = [("TEXT_COLOR", "Мой перевод"), ("THEM_COLOR", "Собеседник"),
+              ("STATUS_COLOR", "Сообщения"), ("PANEL_COLOR", "Фон"), ("OUTLINE_COLOR", "Тень")]
+    DEFAULT_LOOK = {"TEXT_OPACITY": 0.95, "PANEL_OPACITY": 0.55, "TEXT_COLOR": "#FFFFFF",
+                    "THEM_COLOR": "#80D8FF", "STATUS_COLOR": "#FFD54F",
+                    "PANEL_COLOR": "#15111D", "OUTLINE_COLOR": "#000000"}
 
     def __init__(self, app):
         from tkinter import ttk
@@ -1682,22 +2073,42 @@ class SettingsWindow:
 
         box = ttk.LabelFrame(frm, text="Текст на экране", padding=10)
         box.grid(row=3, column=0, sticky="ew", pady=(0, 10))
-        ttk.Label(box, text="Прозрачность:").grid(row=0, column=0, sticky="w", pady=3)
+        ttk.Label(box, text="Прозрачность текста:").grid(row=0, column=0, sticky="w", pady=3)
         self.opacity = tk.DoubleVar(value=TEXT_OPACITY)
         ttk.Scale(box, from_=0.2, to=1.0, variable=self.opacity, length=220
                   ).grid(row=0, column=1, sticky="w", pady=3)
         self.opacity_label = ttk.Label(box, width=5)
         self.opacity_label.grid(row=0, column=2, sticky="w", padx=(8, 0))
+        ttk.Label(box, text="Фон под текстом:").grid(row=1, column=0, sticky="w", pady=3)
+        self.panel = tk.DoubleVar(value=PANEL_OPACITY)
+        ttk.Scale(box, from_=0.0, to=1.0, variable=self.panel, length=220
+                  ).grid(row=1, column=1, sticky="w", pady=3)
+        self.panel_label = ttk.Label(box, width=5)
+        self.panel_label.grid(row=1, column=2, sticky="w", padx=(8, 0))
+        # цвета: квадратики, по щелчку — выбор цвета
+        ttk.Label(box, text="Цвета:").grid(row=2, column=0, sticky="nw", pady=(6, 3))
+        cf = ttk.Frame(box)
+        cf.grid(row=2, column=1, columnspan=2, sticky="w", pady=(6, 3))
+        self.colors = {}
+        for i, (var_name, caption) in enumerate(self.COLORS):
+            var = tk.StringVar(value=globals()[var_name])
+            sw_ = tk.Label(cf, width=4, bg=var.get(), relief="solid", bd=1, cursor="hand2")
+            sw_.grid(row=0, column=i, padx=(0, 12))
+            ttk.Label(cf, text=caption, foreground="#555").grid(row=1, column=i, padx=(0, 12))
+            sw_.bind("<Button-1>", lambda _e, n=var_name, c=caption: self.pick_color(n, c))
+            self.colors[var_name] = (var, sw_)
         sh = win.winfo_screenheight()
         spins = [("FONT_SIZE", "Размер шрифта:", 8, 96, 1),
                  ("DISPLAY_SECONDS", "Время показа, секунд:", 1, 60, 1),
                  ("Y_FROM_BOTTOM", "Мой перевод — отступ снизу, пикс.:", 0, sh, 10),
                  ("THEM_Y_FROM_TOP", "Перевод собеседника — отступ сверху, пикс.:", 0, sh, 10)]
-        for r, spin in enumerate(spins, start=1):
+        for r, spin in enumerate(spins, start=3):
             self._num_row(box, r, *spin)
-        ttk.Label(box, text="Пока окно открыто, на экране показан пример текста.",
-                  foreground="#666").grid(row=len(spins) + 1, column=0, columnspan=3,
-                                          sticky="w", pady=(6, 0))
+        foot = ttk.Frame(box)
+        foot.grid(row=20, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        ttk.Label(foot, text="Пока окно открыто, на экране показан пример текста.",
+                  foreground="#666").pack(side="left")
+        ttk.Button(foot, text="Вид по умолчанию", command=self.reset_look).pack(side="right")
 
         # --- запуск ---
         box = ttk.LabelFrame(frm, text="Запуск", padding=10)
@@ -1733,7 +2144,8 @@ class SettingsWindow:
         ttk.Button(bar, text="Отмена", command=self.cancel).pack(side="right", padx=6)
         ttk.Button(bar, text="ОК", command=lambda: self.apply(True)).pack(side="right")
 
-        for var in [self.opacity] + [v for v, *_ in self.nums.values()]:
+        for var in ([self.opacity, self.panel] + [v for v, *_ in self.nums.values()]
+                    + [v for v, _ in self.colors.values()]):
             var.trace_add("write", lambda *_: self.preview())
         self.preview()
 
@@ -1812,9 +2224,29 @@ class SettingsWindow:
         threading.Thread(target=worker, daemon=True, name="capture-key").start()
 
     # ---------- вид текста ----------
+    def pick_color(self, var_name, caption):
+        from tkinter import colorchooser
+        var, swatch = self.colors[var_name]
+        _rgb_, hex_ = colorchooser.askcolor(color=var.get(), parent=self.win,
+                                            title=f"Цвет: {caption.lower()}")
+        if hex_:
+            var.set(hex_.upper())
+            swatch.config(bg=hex_)
+
+    def reset_look(self):
+        look = self.DEFAULT_LOOK
+        self.opacity.set(look["TEXT_OPACITY"])
+        self.panel.set(look["PANEL_OPACITY"])
+        for var_name, (var, swatch) in self.colors.items():
+            var.set(look[var_name])
+            swatch.config(bg=look[var_name])
+
     def read_visual(self):
         """Значения вида текста из полей окна; ValueError — если что-то не так."""
-        v = {"TEXT_OPACITY": round(float(self.opacity.get()), 2)}
+        v = {"TEXT_OPACITY": round(float(self.opacity.get()), 2),
+             "PANEL_OPACITY": round(float(self.panel.get()), 2)}
+        for var_name, (var, _) in self.colors.items():
+            v[var_name] = var.get()
         for var_name, (var, lo, hi, label) in self.nums.items():
             text = var.get().strip().replace(",", ".")
             try:
@@ -1834,14 +2266,16 @@ class SettingsWindow:
 
     def preview(self):
         self.opacity_label.config(text=f"{self.opacity.get():.2f}")
+        self.panel_label.config(text=f"{self.panel.get():.2f}")
         try:
             values = self.read_visual()
         except ValueError:
             return  # число ещё набирают — подождём
         self.show_visual(values)
         ov = self.app.overlays
-        ov["me"].show("Пример: мой перевод\nExample: my translation", None, TEXT_COLOR)
-        ov["them"].show("Пример: перевод собеседника\nExample: teammate", None, THEM_COLOR)
+        ov["me"].show([("Example: my translation", "Пример: мой перевод")], None, TEXT_COLOR)
+        ov["them"].show([("Пример: перевод собеседника", "Example: teammate's words")],
+                        None, THEM_COLOR)
 
     # ---------- кнопки ----------
     def apply(self, close):
@@ -1947,13 +2381,137 @@ class SettingsWindow:
 
 # ======================= ГЛАВНОЕ =======================
 
+def _notes_text(md):
+    """Описание релиза (markdown из CHANGELOG) -> простой текст с «•»."""
+    out = []
+    for line in md.splitlines():
+        t = line.strip()
+        if t == "---":
+            break  # дальше — инструкция по установке, она тут не нужна
+        if not t:
+            continue
+        t = re.sub(r"\*\*(.+?)\*\*", r"\1", t).replace("`", "")
+        if t.startswith("- "):
+            out.append("•  " + t[2:])
+        elif out and line.startswith("  "):
+            out[-1] += " " + t
+        else:
+            out.append(t)
+    return "\n\n".join(out)
+
+
+class UpdateWindow:
+    """Окно «Вышла новая версия»: что нового, кнопка «Обновить», полоса загрузки."""
+
+    def __init__(self, app):
+        from tkinter import ttk
+        from PIL import ImageTk
+        self.app = app
+        version, self.url, notes, _setup = app.update_info
+        self.win = win = tk.Toplevel(app.root)
+        win.title(f"Обновление {APP_NAME}")
+        win.resizable(False, False)
+        win.attributes("-topmost", True)
+        try:
+            win.iconbitmap(make_icon_file())
+        except Exception:
+            pass
+        win.protocol("WM_DELETE_WINDOW", self.close)
+        frm = ttk.Frame(win, padding=18)
+        frm.pack(fill="both", expand=True)
+
+        head = ttk.Frame(frm)
+        head.pack(fill="x")
+        self.logo = ImageTk.PhotoImage(draw_icon(64), master=win)
+        ttk.Label(head, image=self.logo).pack(side="left", padx=(0, 14))
+        titles = ttk.Frame(head)
+        titles.pack(side="left", fill="x")
+        ttk.Label(titles, text=f"Вышла новая версия {APP_NAME} {version}",
+                  font=("Segoe UI", 15, "bold")).pack(anchor="w")
+        ttk.Label(titles, text=f"У вас сейчас {APP_VERSION}  ·  By {APP_AUTHOR}",
+                  foreground="#777").pack(anchor="w", pady=(2, 0))
+
+        ttk.Label(frm, text="Что нового", font=("Segoe UI", 10, "bold")
+                  ).pack(anchor="w", pady=(16, 6))
+        box = tk.Frame(frm, bg="#F4F1FA", highlightthickness=1, highlightbackground="#DDD6EE")
+        box.pack(fill="both")
+        txt = tk.Text(box, width=66, height=11, wrap="word", font=("Segoe UI", 10),
+                      relief="flat", bg="#F4F1FA", padx=12, pady=10, borderwidth=0,
+                      highlightthickness=0, spacing1=1, spacing3=1)
+        scroll = ttk.Scrollbar(box, command=txt.yview)
+        txt.config(yscrollcommand=scroll.set)
+        txt.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        txt.insert("1.0", _notes_text(notes) or "Описание не указано.")
+        txt.config(state="disabled")
+
+        self.pframe = ttk.Frame(frm)
+        self.pframe.pack(fill="x", pady=(14, 0))
+        self.progress = ttk.Progressbar(self.pframe, mode="determinate", maximum=100)
+        self.status = ttk.Label(self.pframe, foreground="#555")
+        self.self_update = app.can_self_update()
+        if not self.self_update:
+            ttk.Label(self.pframe, foreground="#777", justify="left",
+                      text="Kat запущен из исходников: новая версия скачивается со страницы "
+                           "релиза.\nПроще всего — установить KatSetup.exe оттуда: настройки и "
+                           "модели перенесутся сами.").pack(anchor="w")
+
+        bar = ttk.Frame(frm)
+        bar.pack(fill="x", pady=(14, 0))
+        self.btn_go = ttk.Button(bar, text="Обновить сейчас" if self.self_update
+                                 else "Открыть страницу загрузки", command=self.go)
+        self.btn_go.pack(side="right")
+        self.btn_later = ttk.Button(bar, text="Позже", command=self.close)
+        self.btn_later.pack(side="right", padx=8)
+
+        win.update_idletasks()
+        x = (win.winfo_screenwidth() - win.winfo_width()) // 2
+        y = (win.winfo_screenheight() - win.winfo_height()) // 3
+        win.geometry(f"+{x}+{y}")
+        win.deiconify()
+        win.lift()
+        win.focus_force()
+
+    def go(self):
+        import webbrowser
+        if not self.self_update:
+            webbrowser.open(self.url)
+            self.close()
+            return
+        self.btn_go.config(state="disabled")
+        self.btn_later.config(state="disabled")
+        self.progress.pack(fill="x")
+        self.status.pack(anchor="w", pady=(6, 0))
+        self.set_status("Подключаюсь...", 0)
+        threading.Thread(target=self.app._self_update, args=(self,), daemon=True,
+                         name="self-update").start()
+
+    def set_status(self, text, pct=None):
+        if not self.win.winfo_exists():
+            return
+        self.status.config(text=text)
+        if pct is not None:
+            self.progress.config(value=pct)
+
+    def failed(self, msg):
+        if not self.win.winfo_exists():
+            return
+        self.set_status(f"Не получилось обновиться: {msg}")
+        self.btn_go.config(state="normal", text="Попробовать ещё раз")
+        self.btn_later.config(state="normal")
+
+    def close(self):
+        self.win.destroy()
+        self.app.update_window = None
+
+
 class App:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title(APP_NAME)
         self.overlays = {
-            "me": Overlay(self.root, y_from_bottom=Y_FROM_BOTTOM),
-            "them": Overlay(tk.Toplevel(self.root), y_from_top=THEM_Y_FROM_TOP),
+            "me": make_overlay(self.root, y_from_bottom=Y_FROM_BOTTOM),
+            "them": make_overlay(tk.Toplevel(self.root), y_from_top=THEM_Y_FROM_TOP),
         }
         self.ui_q = queue.Queue()
         self.state = {"model": None, "mt": {}, "hints": None,
@@ -1966,6 +2524,7 @@ class App:
         self.live_phrase_lang = None  # язык текущей фразы (определяется один раз на фразу)
         self.update_info = None  # (версия, ссылка, что нового), если на GitHub есть новее
         self.glossary = None  # словарь glossary.txt — общий для всех моделей перевода
+        self.update_window = None
         self.settings_window = None
         self.tray = None
 
@@ -2065,7 +2624,12 @@ class App:
                   f"Выход: {EXIT_HOTKEY} или через иконку в трее.")
             if st["live"]:
                 print("[живой] живой перевод включён")
-            self.show("me", f"Готово ({desc}). {HOTKEY.upper()} — говорить{them_info}", 5)
+            ready = (f"Готово ({desc})", f"{HOTKEY.upper()} — говорить{them_info}")
+            prev = self.remember_version()
+            if prev and prev != APP_VERSION:
+                print(f"[обновление] {APP_NAME} обновлён: {prev} -> {APP_VERSION}")
+                ready = (f"{APP_NAME} обновлён: {prev} → {APP_VERSION} ✓", ready[0])
+            self.show("me", [ready], 6)
             if CHECK_UPDATES:
                 threading.Thread(target=self.update_checker, daemon=True, name="updates").start()
         except Exception as e:
@@ -2277,9 +2841,8 @@ class App:
             if not en:
                 self.show("me", "(ничего не расслышал)", 2)
                 return
-            text = f"{ru}\n{en}" if SHOW_ORIGINAL else en
-            print(f"[я] {text}")
-            self.show("me", text, DISPLAY_SECONDS, TEXT_COLOR)
+            print(f"[я] {ru}\n{en}")
+            self.show("me", [(en, ru if SHOW_ORIGINAL else None)], DISPLAY_SECONDS, TEXT_COLOR)
             if COPY_TO_CLIPBOARD:
                 self.ui_q.put(("clip", en))
         except Exception as e:
@@ -2327,12 +2890,12 @@ class App:
                 self.show("them", "(речи не слышно)", 2)
                 return
             if lang == SOURCE_LANG:
-                text = heard  # уже на моём языке
+                entry = (heard, None)  # уже на моём языке
             else:
-                text = f"{ru}\n{heard}" if SHOW_ORIGINAL else ru
-            print(f"[собеседник] {text}")
+                entry = (ru, heard if SHOW_ORIGINAL else None)
+            print(f"[собеседник] {entry[0]}" + (f"\n{entry[1]}" if entry[1] else ""))
             self.them_hold_until = time.monotonic() + DISPLAY_SECONDS
-            self.show("them", text, DISPLAY_SECONDS, THEM_COLOR)
+            self.show("them", [entry], DISPLAY_SECONDS, THEM_COLOR)
         except Exception as e:
             traceback.print_exc()
             self.show("them", f"Ошибка: {e}", 4)
@@ -2492,8 +3055,7 @@ class App:
                   f" + перевод {t2 - t1:.2f} с")
             print(f"[живой] {heard}")
             print(f"[живой] {ru}")
-        text = f"{ru}\n{heard}" if SHOW_ORIGINAL else ru
-        self.show_live(text if final else text + " …", final)
+        self.show_live((ru if final else ru + " …", heard if SHOW_ORIGINAL else None), final)
 
     def show_live(self, text, final):
         """Субтитры: две последние фразы. Черновик текущей фразы заменяется
@@ -2511,8 +3073,7 @@ class App:
             if text is None:
                 self.ui_q.put(("hide", "them"))
             return
-        sep = "\n\n" if SHOW_ORIGINAL else "\n"
-        self.show("them", sep.join(x for _, x, _ in self.live_lines), DISPLAY_SECONDS, THEM_COLOR)
+        self.show("them", [x for _, x, _ in self.live_lines], DISPLAY_SECONDS, THEM_COLOR)
 
     # ---------- смена устройств на ходу (из окна настроек) ----------
     def switch_mic(self, device, problems):
@@ -2547,6 +3108,23 @@ class App:
         return True
 
     # ---------- обновления ----------
+    @staticmethod
+    def remember_version():
+        """Версия, с которой запускались в прошлый раз (и запомнить текущую)."""
+        path = os.path.join(BASE_DIR, "version.txt")
+        prev = None
+        try:
+            with open(path, encoding="utf-8") as f:
+                prev = f.read().strip() or None
+        except OSError:
+            pass
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(APP_VERSION)
+        except OSError:
+            pass
+        return prev
+
     def update_checker(self):
         time.sleep(6)  # пусть сначала погаснет сообщение «Готово»
         try:
@@ -2564,8 +3142,8 @@ class App:
             print("[обновление] Что нового:\n" + notes)
         self.call_in_ui(self.update_tray)
         how = "Обновить" if self.can_self_update() else "Скачать"
-        self.show("me", f"Вышла новая версия {APP_NAME} {version}!\n"
-                        f"{how} — в меню иконки в трее", 10)
+        self.show("me", [(f"Вышла новая версия {APP_NAME} {version}!",
+                          f"«⬇ {how}» — в меню иконки {APP_NAME} в трее")], 10)
 
     def can_self_update(self):
         """Обновиться сами можем только установленной версией (Kat.exe) и если в релизе
@@ -2573,41 +3151,52 @@ class App:
         return FROZEN and self.update_info is not None and self.update_info[3] is not None
 
     def open_update_page(self):
-        import webbrowser
         if self.update_info is None:
             return
-        if self.can_self_update():
-            if not ask_yes_no(f"Обновить {APP_NAME} до версии {self.update_info[0]}?\n\n"
-                              "Kat скачает установщик, закроется на минуту и запустится "
-                              "уже новым. Настройки и модели сохранятся."):
-                return
-            threading.Thread(target=self._self_update, daemon=True, name="self-update").start()
-        else:
-            webbrowser.open(self.update_info[1])
+        if self.update_window is not None and self.update_window.win.winfo_exists():
+            self.update_window.win.lift()
+            return
+        self.update_window = UpdateWindow(self)
 
-    def _self_update(self):
-        """Скачать KatSetup.exe из релиза и запустить его тихо; он закроет Kat,
-        обновит файлы и запустит новую версию."""
+    def _self_update(self, window):
+        """Скачать KatSetup.exe из релиза (с полосой загрузки в окне) и запустить его;
+        установщик закроет Kat, обновит файлы и запустит новую версию."""
         import tempfile
-        global _download_hook
+        global _progress_hook
         version, _url, _notes, setup_url = self.update_info
         dest = os.path.join(tempfile.gettempdir(), f"KatSetup-{version}.exe")
-        _download_hook = lambda text: self.show("me", f"Обновление: {text}")  # noqa: E731
+        t0, last = time.monotonic(), [0.0]
+
+        def progress(done, total):
+            now = time.monotonic()
+            if now - last[0] < 0.15 and done < total:
+                return
+            last[0] = now
+            speed = done / 2 ** 20 / max(0.1, now - t0)
+            text = (f"Скачиваю: {done / 2**20:.1f} из {total / 2**20:.1f} МБ · {speed:.1f} МБ/с"
+                    if total else f"Скачиваю: {done / 2**20:.1f} МБ")
+            self.call_in_ui(lambda: window.set_status(text, done * 100 / total if total else None))
+
+        _progress_hook = progress
         try:
-            if os.path.exists(dest):
-                os.remove(dest)
+            for f in (dest, dest + ".part"):
+                if os.path.exists(f):
+                    os.remove(f)
             if not download_file(setup_url, dest):
                 raise RuntimeError("установщик не найден в релизе")
             print(f"[обновление] запускаю {dest}")
-            self.show("me", f"Устанавливаю {APP_NAME} {version}...", 30)
+            self.call_in_ui(lambda: window.set_status(
+                f"Устанавливаю {APP_NAME} {version}... Kat закроется и через минуту "
+                "запустится уже новым.", 100))
+            time.sleep(1.5)
             subprocess.Popen([dest, "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LAUNCH=1",
                               f"/DIR={BASE_DIR}"], close_fds=True)
             self.ui_q.put(("quit",))
         except Exception as e:
             traceback.print_exc()
-            self.show("me", f"Не удалось обновиться: {e}", 8)
+            self.call_in_ui(lambda: window.failed(str(e)))
         finally:
-            _download_hook = None
+            _progress_hook = None
 
     # ---------- трей ----------
     def start_tray(self):
@@ -2731,6 +3320,12 @@ def main():
     if "--selftest" in args:
         selftest(args)
         return
+    if MIGRATED_FROM and "translator.py" in (_run_value() or ""):
+        try:  # автозапуск вёл на прежнюю копию — переключаем на Kat.exe
+            _set_run_value(True)
+            print("[автозапуск] переключён на новую версию")
+        except OSError as e:
+            print(f"[!] Не удалось переключить автозапуск: {e}")
     if os.name == "nt":
         if requirements_changed():
             if ask_yes_no("Программа обновилась, и ей нужны новые компоненты.\n\n"
