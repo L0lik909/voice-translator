@@ -88,6 +88,7 @@ Type: files; Name: "{app}\log.old.txt"
 Type: files; Name: "{app}\last.wav"
 Type: files; Name: "{app}\icon-*.ico"
 Type: files; Name: "{app}\version.txt"
+Type: files; Name: "{app}\history.jsonl"
 Type: files; Name: "{app}\migrate_from.txt"
 Type: dirifempty; Name: "{app}"
 

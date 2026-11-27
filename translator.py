@@ -37,7 +37,7 @@ import configparser
 
 APP_NAME = "Kat"
 APP_AUTHOR = "L0lik"
-APP_VERSION = "1.6.0"  # менять при каждом обновлении + запись в CHANGELOG.md
+APP_VERSION = "1.6.1"  # менять при каждом обновлении + запись в CHANGELOG.md
 OLD_APP_NAMES = ("Голосовой переводчик",)  # прежние названия — их ярлыки заменяем новыми
 # FROZEN — запущены как Kat.exe из установщика (PyInstaller), а не как translator.py
 FROZEN = bool(getattr(sys, "frozen", False))
@@ -257,6 +257,10 @@ run_as_admin = нет
 
 ; При запуске проверять, не вышла ли новая версия Kat на GitHub (да / нет).
 check_updates = да
+
+; Сохранять историю переводов на диск (history.jsonl рядом с программой), чтобы она
+; не пропадала после перезапуска (да / нет). Смотреть — меню иконки в трее → «История».
+keep_history = да
 """
 
 # Какая строка settings.ini в какую переменную программы попадает:
@@ -294,6 +298,7 @@ SPEC = [
     ("MIN_SECONDS", "внешний_вид", "min_seconds", "float"),
     ("RUN_AS_ADMIN", "запуск", "run_as_admin", "bool"),
     ("CHECK_UPDATES", "запуск", "check_updates", "bool"),
+    ("KEEP_HISTORY", "запуск", "keep_history", "bool"),
 ]
 
 
@@ -2008,6 +2013,264 @@ def check_for_update():
     return tag.lstrip("vV"), url, (data.get("body") or "").strip(), setup
 
 
+# ======================= ИСТОРИЯ ПЕРЕВОДОВ =======================
+
+HISTORY_FILE = os.path.join(BASE_DIR, "history.jsonl")
+HISTORY_MAX = 1000  # столько последних фраз хранится
+
+
+class History:
+    """Последние переводы: кто сказал, с какого языка на какой, оригинал и перевод.
+    Пишется в history.jsonl (если включено keep_history), окно истории подписывается
+    на новые записи через listeners."""
+
+    def __init__(self):
+        self.items = collections.deque(maxlen=HISTORY_MAX)
+        self.lock = threading.Lock()
+        self.listeners = []
+        self.written = 0  # строк в файле — когда их сильно больше лимита, файл сжимаем
+        if KEEP_HISTORY:
+            self._load()
+
+    def _load(self):
+        import json
+        try:
+            with open(HISTORY_FILE, encoding="utf-8") as f:
+                lines = f.readlines()
+        except OSError:
+            return
+        for line in lines[-HISTORY_MAX:]:
+            try:
+                self.items.append(json.loads(line))
+            except ValueError:
+                pass
+        self.written = len(lines)
+
+    def add(self, who, src, dst, original, translation):
+        import json
+        item = {"t": time.strftime("%Y-%m-%d %H:%M:%S"), "who": who, "src": src, "dst": dst,
+                "orig": original or "", "tr": translation or ""}
+        with self.lock:
+            self.items.append(item)
+            if KEEP_HISTORY:
+                try:
+                    if self.written > HISTORY_MAX * 2:  # не даём файлу расти бесконечно
+                        self._rewrite()
+                    with open(HISTORY_FILE, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(item, ensure_ascii=False) + "\n")
+                    self.written += 1
+                except OSError as e:
+                    print(f"[!] Не удалось записать историю: {e}")
+        for fn in list(self.listeners):
+            fn(item)
+
+    def _rewrite(self):
+        import json
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            for it in self.items:
+                f.write(json.dumps(it, ensure_ascii=False) + "\n")
+        self.written = len(self.items)
+
+    def clear(self):
+        with self.lock:
+            self.items.clear()
+            try:
+                if os.path.exists(HISTORY_FILE):
+                    os.remove(HISTORY_FILE)
+            except OSError as e:
+                print(f"[!] Не удалось удалить {HISTORY_FILE}: {e}")
+            self.written = 0
+
+    def set_keep(self, keep):
+        """Включили — сохранить то, что уже есть; выключили — стереть файл с диска."""
+        with self.lock:
+            try:
+                if keep:
+                    self._rewrite()
+                elif os.path.exists(HISTORY_FILE):
+                    os.remove(HISTORY_FILE)
+                    self.written = 0
+            except OSError as e:
+                print(f"[!] История: {e}")
+
+
+class HistoryWindow:
+    """Окно «История переводов»: оригинал и перевод каждой фразы, фильтр и поиск."""
+
+    FILTERS = {"Все": None, "Мои (F9)": "me", "Собеседники": "them"}
+
+    def __init__(self, app):
+        from tkinter import ttk
+        self.app = app
+        self.win = win = tk.Toplevel(app.root)
+        win.title(f"История переводов — {APP_NAME}")
+        win.geometry("760x620")
+        win.minsize(520, 360)
+        win.attributes("-topmost", True)
+        try:
+            win.iconbitmap(make_icon_file())
+        except Exception:
+            pass
+        win.protocol("WM_DELETE_WINDOW", self.close)
+        outer = ttk.Frame(win, padding=(16, 12, 16, 12))
+        outer.pack(fill="both", expand=True)
+
+        top = ttk.Frame(outer)
+        top.pack(fill="x", pady=(0, 10))
+        ttk.Label(top, text="История переводов", font=("Segoe UI Semibold", 15)).pack(side="left")
+        self.count = ttk.Label(top, foreground=UI["muted"])
+        self.count.pack(side="left", padx=(12, 0), pady=(4, 0))
+
+        bar = ttk.Frame(outer)
+        bar.pack(fill="x", pady=(0, 8))
+        self.filter = tk.StringVar(value="Все")
+        ttk.Combobox(bar, textvariable=self.filter, values=list(self.FILTERS), state="readonly",
+                     width=14).pack(side="left")
+        ttk.Label(bar, text="Поиск:").pack(side="left", padx=(14, 6))
+        self.search = tk.StringVar()
+        ttk.Entry(bar, textvariable=self.search, width=26).pack(side="left")
+        self.filter.trace_add("write", lambda *_: self.refill())
+        self.search.trace_add("write", lambda *_: self.refill())
+
+        self.foot = ttk.Frame(outer)
+        self.foot.pack(side="bottom", fill="x", pady=(10, 0))
+        box = tk.Frame(outer, bg=UI["box"], highlightthickness=1,
+                       highlightbackground=UI["box_border"])
+        box.pack(fill="both", expand=True)
+        self.text = t = tk.Text(box, wrap="word", font=("Segoe UI", 11), relief="flat",
+                                bg=UI["box"], fg=UI["box_fg"], padx=14, pady=10, borderwidth=0,
+                                highlightthickness=0, cursor="arrow")
+        scroll = ttk.Scrollbar(box, command=t.yview)
+        t.config(yscrollcommand=scroll.set)
+        t.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        t.tag_config("meta", foreground=UI["muted"], font=("Segoe UI", 9), spacing1=10)
+        t.tag_config("orig", foreground=UI["box_fg"], spacing1=2)
+        t.tag_config("tr_me", foreground=TEXT_COLOR, font=("Segoe UI Semibold", 12), spacing3=4)
+        t.tag_config("tr_them", foreground=THEM_COLOR, font=("Segoe UI Semibold", 12), spacing3=4)
+        t.tag_config("empty", foreground=UI["muted"], justify="center", spacing1=40)
+        # копировать выделенное — Ctrl+C работает и в режиме «только чтение»
+        t.bind("<Control-c>", lambda e: self._copy_selection())
+        t.bind("<Control-C>", lambda e: self._copy_selection())
+
+        foot = self.foot
+        self.keep = tk.BooleanVar(value=KEEP_HISTORY)
+        ttk.Checkbutton(foot, text="Сохранять историю на диск", variable=self.keep,
+                        command=self.toggle_keep).pack(side="left")
+        ttk.Button(foot, text="Закрыть", command=self.close).pack(side="right")
+        ttk.Button(foot, text="Очистить", command=self.clear).pack(side="right", padx=8)
+        ttk.Button(foot, text="Копировать всё", command=self.copy_all).pack(side="right")
+
+        self.refill()
+        app.history.listeners.append(self._on_new)
+        win.update_idletasks()
+        win.geometry(f"+{(win.winfo_screenwidth() - win.winfo_width()) // 2}"
+                     f"+{(win.winfo_screenheight() - win.winfo_height()) // 4}")
+        win.lift()
+        win.focus_force()
+
+    # --- показ ---
+    def _match(self, it):
+        who = self.FILTERS.get(self.filter.get())
+        if who and it["who"] != who:
+            return False
+        q = self.search.get().strip().lower()
+        return not q or q in it["orig"].lower() or q in it["tr"].lower()
+
+    @staticmethod
+    def _line(it):
+        who = "Я" if it["who"] == "me" else "Собеседник"
+        pair = (f"{it['src'].upper()} → {it['dst'].upper()}" if it["tr"]
+                else f"{it['src'].upper()}, без перевода")
+        return f"{it['t'][11:16]}  ·  {it['t'][:10]}  ·  {who}  ·  {pair}"
+
+    def _insert(self, it):
+        t = self.text
+        t.insert("end", self._line(it) + "\n", "meta")
+        if it["tr"]:
+            t.insert("end", it["orig"] + "\n", "orig")
+            t.insert("end", it["tr"] + "\n", "tr_me" if it["who"] == "me" else "tr_them")
+        else:
+            t.insert("end", it["orig"] + "\n", "tr_them")
+
+    def refill(self):
+        t = self.text
+        t.config(state="normal")
+        t.delete("1.0", "end")
+        items = [it for it in list(self.app.history.items) if self._match(it)]
+        for it in items:
+            self._insert(it)
+        if not items:
+            t.insert("end", "Пока пусто — здесь появятся ваши переводы (F9)\n"
+                            "и переводы собеседников (F10 и живой перевод F11).", "empty")
+        t.config(state="disabled")
+        t.see("end")
+        total = len(self.app.history.items)
+        self.count.config(text=f"{len(items)} из {total}" if len(items) != total else f"{total}")
+
+    def _on_new(self, it):
+        def add():
+            if self.win.winfo_exists():
+                self.refill() if len(self.app.history.items) == 1 else self._append(it)
+        self.app.call_in_ui(add)
+
+    def _append(self, it):
+        if not self._match(it):
+            return
+        t = self.text
+        at_end = t.yview()[1] > 0.98
+        t.config(state="normal")
+        self._insert(it)
+        t.config(state="disabled")
+        if at_end:
+            t.see("end")
+        self.count.config(text=str(len(self.app.history.items)))
+
+    # --- кнопки ---
+    def _copy_selection(self):
+        try:
+            text = self.text.get("sel.first", "sel.last")
+        except tk.TclError:
+            return "break"
+        self.win.clipboard_clear()
+        self.win.clipboard_append(text)
+        return "break"
+
+    def copy_all(self):
+        lines = []
+        for it in self.app.history.items:
+            if self._match(it):
+                lines.append(self._line(it))
+                lines.append(it["orig"])
+                if it["tr"]:
+                    lines.append(it["tr"])
+                lines.append("")
+        self.win.clipboard_clear()
+        self.win.clipboard_append("\n".join(lines))
+        self.count.config(text=f"{self.count.cget('text')}  ·  скопировано ✓")
+
+    def clear(self):
+        from tkinter import messagebox
+        if messagebox.askyesno("История", "Удалить всю историю переводов?", parent=self.win):
+            self.app.history.clear()
+            self.refill()
+
+    def toggle_keep(self):
+        keep = self.keep.get()
+        set_settings({"KEEP_HISTORY": keep})
+        try:
+            save_settings({"KEEP_HISTORY": keep})
+        except OSError as e:
+            print(f"[!] Не удалось сохранить настройку истории: {e}")
+        self.app.history.set_keep(keep)
+
+    def close(self):
+        if self._on_new in self.app.history.listeners:
+            self.app.history.listeners.remove(self._on_new)
+        self.win.destroy()
+        self.app.history_window = None
+
+
 # ======================= ОКНО НАСТРОЕК =======================
 
 # Цвета подписей под тему окон: тёмная (sv-ttk, как в Windows 11) или обычная
@@ -2316,7 +2579,12 @@ class SettingsWindow:
         extra = self.lang_map.get(self.extra_var.get(), "")
         values = ["Английский"] + ([lang_name(extra)] if extra else [])
         self.target_box.config(values=values)
-        if self.target_var.get() not in values:
+        if hasattr(self, "lang_status") and extra and extra != EXTRA_LANG:
+            # выбрали НОВЫЙ язык — скорее всего, на нём и говорить: переводить речь на него.
+            # Раньше это был отдельный список, и его не замечали: «скачал японский, а F9
+            # переводит на английский». Вернуть английский можно в том же списке.
+            self.target_var.set(lang_name(extra))
+        elif self.target_var.get() not in values:
             self.target_var.set("Английский")
         if hasattr(self, "lang_status"):
             self.show_lang_status()
@@ -2558,6 +2826,9 @@ class SettingsWindow:
             whisper = MODEL_SIZE
         whisper_prev = MODEL_SIZE
         extra_changed = extra != EXTRA_LANG
+        print(f"[языки] собеседники: английский"
+              + (f" + {lang_name(extra)}" if extra else "")
+              + f"; моя речь (F9) -> {lang_name(target)}")
         mic = self.mic_map[self.mic_var.get()]
         out = self.out_map[self.out_var.get()]
         if not app.switch_mic(mic, problems):
@@ -2771,6 +3042,7 @@ class App:
                       "rec": None, "loop": None, "busy_me": False, "busy_them": False,
                       "paused": False, "capturing": False, "live": LIVE}
         self.model_lock = threading.Lock()  # видеокарта считает одну фразу за раз
+        self.mt_lock = threading.Lock()  # загрузка моделей перевода — по одной
         self.live_lines = []  # живой перевод: (время, текст) последних фраз на экране
         self.live_key_down = False  # клавиша живого перевода нажата (защита от автоповтора)
         self.them_hold_until = 0.0  # до этого момента на экране результат F10 — не перекрывать
@@ -2778,6 +3050,8 @@ class App:
         self.update_info = None  # (версия, ссылка, что нового), если на GitHub есть новее
         self.glossary = None  # словарь glossary.txt — общий для всех моделей перевода
         self.update_window = None
+        self.history = History()
+        self.history_window = None
         self.lang_state = None  # (код, "loading" | "ready" | "error", текст) — для настроек
         self.model_state = None  # ("loading" | "error", текст) модели распознавания
         self.model_desc = ""  # например «GPU, large-v3-turbo»
@@ -2986,9 +3260,11 @@ class App:
 
     # ---------- языки ----------
     def load_mt(self, direction):
-        """Загрузить модель перевода quickmt-<direction> (скачать, если её нет)."""
-        if direction not in self.state["mt"]:
-            self.state["mt"][direction] = TextTranslator(f"quickmt-{direction}", self.glossary)
+        """Загрузить модель перевода quickmt-<direction> (скачать, если её нет).
+        Под замком: язык могут подхватывать одновременно запуск Kat и окно настроек."""
+        with self.mt_lock:
+            if direction not in self.state["mt"]:
+                self.state["mt"][direction] = TextTranslator(f"quickmt-{direction}", self.glossary)
 
     @staticmethod
     def _chain(src, dst):
@@ -3125,9 +3401,19 @@ class App:
 
     def _install_language(self, code):
         global _download_hook
-        if self.state["model"] is None:  # модели ещё грузятся — язык подхватит loader
-            return
         name = lang_name(code)
+        if self.state["model"] is None or self.glossary is None:
+            # Kat ещё загружается или меняет модель распознавания. Раньше язык в этот момент
+            # просто не подключался — и до перезапуска переводилось на английский.
+            self._set_lang_state(code, "loading", f"{name}: подключится, как только Kat загрузится")
+            while self.state["model"] is None or self.glossary is None:
+                time.sleep(0.5)
+            if EXTRA_LANG != code:  # пока ждали, выбрали другой язык
+                return
+            if self.has_chain(code, SOURCE_LANG) and self.has_chain(SOURCE_LANG, code):
+                # loader уже подключил его сам (обе стороны)
+                self._set_lang_state(code, "ready", f"{name}: готов ✓")
+                return
         self._set_lang_state(code, "loading", f"{name}: загружаю модели перевода...")
         self.show("me", f"{name}: загружаю модели перевода...")
 
@@ -3176,6 +3462,9 @@ class App:
                 self.show("me", "Микрофон молчит — выберите другой в настройках", 4)
                 return
             target = self.my_target()
+            if TARGET_LANG != "en" and target == "en":
+                print(f"[я] выбран {lang_name(TARGET_LANG)}, но его модели не загружены "
+                      f"(доп. язык: {EXTRA_LANG or 'нет'}, загружено: {sorted(st['mt'])})")
             t0 = time.perf_counter()
             if SOURCE_LANG != "en" and self.has_chain(SOURCE_LANG, target):
                 # быстрый путь: Whisper распознаёт один раз, перевод — отдельной моделью
@@ -3185,6 +3474,7 @@ class App:
                 en = self.translate_chain(ru, SOURCE_LANG, target) if ru else ""
             else:
                 # запасной путь (нет quickmt-ru-en или язык не русский): перевод Whisper'ом
+                target = "en"
                 en = self.transcribe(audio, SOURCE_LANG, "translate")
                 t1 = time.perf_counter()
                 ru = (self.transcribe(audio, SOURCE_LANG, "transcribe")
@@ -3202,6 +3492,7 @@ class App:
                 print(f"[я] {note}")
                 sub = f"{sub}\n{note}" if sub else note
             self.show("me", [(en, sub or None)], DISPLAY_SECONDS, TEXT_COLOR)
+            self.history.add("me", SOURCE_LANG, target, ru, en)
             if COPY_TO_CLIPBOARD:
                 self.ui_q.put(("clip", en))
         except Exception as e:
@@ -3253,6 +3544,8 @@ class App:
             else:
                 entry = (ru, heard if SHOW_ORIGINAL else None)
             print(f"[собеседник] {entry[0]}" + (f"\n{entry[1]}" if entry[1] else ""))
+            self.history.add("them", lang, SOURCE_LANG, heard,
+                             ru if lang != SOURCE_LANG else "")
             self.them_hold_until = time.monotonic() + DISPLAY_SECONDS
             self.show("them", [entry], DISPLAY_SECONDS, THEM_COLOR)
         except Exception as e:
@@ -3414,6 +3707,7 @@ class App:
                   f" + перевод {t2 - t1:.2f} с")
             print(f"[живой] {heard}")
             print(f"[живой] {ru}")
+            self.history.add("them", lang, SOURCE_LANG, heard, ru)
         self.show_live((ru if final else ru + " …", heard if SHOW_ORIGINAL else None), final)
 
     def show_live(self, text, final):
@@ -3465,6 +3759,14 @@ class App:
         if old is not None:
             old.close()
         return True
+
+    # ---------- история переводов ----------
+    def open_history(self):
+        if self.history_window is not None and self.history_window.win.winfo_exists():
+            self.history_window.win.deiconify()
+            self.history_window.win.lift()
+            return
+        self.history_window = HistoryWindow(self)
 
     # ---------- передвинуть текст мышкой ----------
     def start_drag(self, on_done=None):
@@ -3653,6 +3955,7 @@ class App:
             item(lambda _: f"Живой перевод ({LIVE_HOTKEY.upper()})",
                  lambda: self.call_in_ui(self.toggle_live),
                  checked=lambda _: self.state["live"]),
+            item("История переводов", lambda: self.call_in_ui(self.open_history)),
             item("Передвинуть текст мышкой", lambda: self.call_in_ui(self.start_drag)),
             item("Пауза", lambda: self.call_in_ui(self.toggle_pause),
                  checked=lambda _: self.state["paused"]),

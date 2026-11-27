@@ -29,4 +29,5 @@ _frozentest/
 installer/Kat.ico
 _installtest/
 version.txt
+history.jsonl
 migrate_from.txt
