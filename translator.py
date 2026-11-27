@@ -37,7 +37,7 @@ import configparser
 
 APP_NAME = "Kat"
 APP_AUTHOR = "L0lik"
-APP_VERSION = "1.6.1"  # менять при каждом обновлении + запись в CHANGELOG.md
+APP_VERSION = "1.6.2"  # менять при каждом обновлении + запись в CHANGELOG.md
 OLD_APP_NAMES = ("Голосовой переводчик",)  # прежние названия — их ярлыки заменяем новыми
 # FROZEN — запущены как Kat.exe из установщика (PyInstaller), а не как translator.py
 FROZEN = bool(getattr(sys, "frozen", False))
@@ -3193,7 +3193,13 @@ class App:
     HALLUCINATION_MARKS = ("субтитр", "dimatorzok", "amara.org", "продолжение следует",
                            "подписывайтесь на канал", "спасибо за просмотр",
                            "thanks for watching", "thank you for watching",
-                           "please subscribe")
+                           "please subscribe",
+                           # то же на других языках — Whisper «слышит» это в тишине и музыке
+                           "ご視聴ありがとうございました", "ご視聴ありがとうございます",
+                           "チャンネル登録", "最後までご視聴", "字幕",
+                           "谢谢观看", "请订阅", "字幕由", "시청해 주셔서 감사합니다",
+                           "시청해주셔서 감사합니다", "구독과 좋아요", "untertitel",
+                           "sous-titres", "subtítulos", "napisy")
     # А эти бывают и настоящими — выкидываем, только если VAD речи не нашёл.
     HALLUCINATION_NO_VAD = {"thank you", "thanks", "you", "bye", "the end", "спасибо",
                             "пока", "до свидания", "угу", "see you next time",
@@ -3238,8 +3244,10 @@ class App:
                 return t
         return ""
 
-    def detect_lang(self, audio, choices):
-        """Какой из языков choices звучит в записи (по вероятностям Whisper)."""
+    def detect_lang(self, audio, choices, prefer=None):
+        """Какой из языков choices звучит в записи (по вероятностям Whisper).
+        prefer — язык недавних фраз: для короткого обрывка (по одному слову Whisper
+        часто ошибается) берём его, если он не совсем невероятен."""
         model = self.state["model"]
         probs = None
         with self.model_lock:
@@ -3252,7 +3260,11 @@ class App:
         if not probs:
             return choices[0]
         p = dict(probs)
-        return max(choices, key=lambda lg: p.get(lg, 0.0))
+        best = max(choices, key=lambda lg: p.get(lg, 0.0))
+        if (prefer in choices and best not in (prefer, SOURCE_LANG) and len(audio) < 2.0 * SAMPLE_RATE
+                and p.get(prefer, 0.0) >= 0.05):
+            return prefer
+        return best
 
     def translate(self, mt, text):
         with self.model_lock:
@@ -3292,9 +3304,14 @@ class App:
             langs.append(SOURCE_LANG)
         return langs
 
-    def them_lang(self, audio):
+    def them_lang(self, audio, prefer=None):
         langs = self.them_langs()
-        return langs[0] if len(langs) == 1 else self.detect_lang(audio, tuple(langs))
+        return langs[0] if len(langs) == 1 else self.detect_lang(audio, tuple(langs), prefer)
+
+    def recent_them_lang(self):
+        """Язык последней переведённой фразы собеседника, если она была недавно (20 с)."""
+        lang, t = getattr(self, "last_them_lang", (None, 0.0))
+        return lang if time.monotonic() - t < 20 else None
 
     def them_ready(self):
         return self.state["model"] is not None and self.has_chain("en", SOURCE_LANG)
@@ -3609,7 +3626,7 @@ class App:
         LoopbackRecorder и не мешает F10 — у него свой буфер.
         """
         from faster_whisper.vad import VadOptions, get_speech_timestamps
-        vad = VadOptions(threshold=0.5, min_speech_duration_ms=int(self.LIVE_MIN_SPEECH * 1000),
+        vad = VadOptions(threshold=0.5, min_speech_duration_ms=250,  # короткие слова («あなた», «yes») — тоже речь
                          min_silence_duration_ms=int(self.LIVE_END_SILENCE * 1000),
                          speech_pad_ms=150)
         st = self.state
@@ -3646,7 +3663,12 @@ class App:
                     pending = np.concatenate([pending, to_16k(np.concatenate(chunks), loop.rate)])
                 if len(pending) < self.LIVE_MIN_SPEECH * sr:
                     continue
-                speech = get_speech_timestamps(pending, vad)
+                # VAD Silero плохо слышит тихий голос (реплики из аниме на 3% громкости
+                # он пропускал целиком), поэтому ищем речь в звуке, выровненном по громкости.
+                # Совсем тихое (шумовой фон) не усиливаем — иначе шум станет «речью».
+                peak = float(np.abs(pending).max())
+                gain = min(0.9 / peak, 100.0) if peak > 0.002 else 1.0
+                speech = get_speech_timestamps(pending * gain if gain > 1.0 else pending, vad)
                 if not speech:
                     pending = pending[-int(0.5 * sr):]  # тишина/шум: держим только хвост
                     continue
@@ -3684,7 +3706,7 @@ class App:
         # язык определяем на первом черновике и на всей фразе в конце (так надёжнее)
         lang = self.live_phrase_lang
         if final or lang is None:
-            lang = self.them_lang(audio)
+            lang = self.them_lang(audio, prefer=self.recent_them_lang())
         self.live_phrase_lang = None if final else lang
         if lang == SOURCE_LANG:
             # речь уже на моём языке (русскоязычные собеседники) — переводить нечего
@@ -3708,6 +3730,7 @@ class App:
             print(f"[живой] {heard}")
             print(f"[живой] {ru}")
             self.history.add("them", lang, SOURCE_LANG, heard, ru)
+            self.last_them_lang = (lang, time.monotonic())
         self.show_live((ru if final else ru + " …", heard if SHOW_ORIGINAL else None), final)
 
     def show_live(self, text, final):
