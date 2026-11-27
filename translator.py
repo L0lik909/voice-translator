@@ -37,7 +37,7 @@ import configparser
 
 APP_NAME = "Kat"
 APP_AUTHOR = "L0lik"
-APP_VERSION = "1.5.1"  # менять при каждом обновлении + запись в CHANGELOG.md
+APP_VERSION = "1.6.0"  # менять при каждом обновлении + запись в CHANGELOG.md
 OLD_APP_NAMES = ("Голосовой переводчик",)  # прежние названия — их ярлыки заменяем новыми
 # FROZEN — запущены как Kat.exe из установщика (PyInstaller), а не как translator.py
 FROZEN = bool(getattr(sys, "frozen", False))
@@ -233,6 +233,11 @@ outline_color = #000000
 panel_color = #15111D
 panel_opacity = 0.55
 
+; Где по горизонтали центр текста: 0.5 = посередине экрана, 0 = левый край,
+; 1 = правый. Удобнее передвинуть мышкой: «Настройки» → «Вид» → «Передвинуть текст».
+me_x = 0.5
+them_x = 0.5
+
 ; Мой перевод: отступ от низа экрана (в пикселях).
 y_from_bottom = 230
 
@@ -284,6 +289,8 @@ SPEC = [
     ("PANEL_OPACITY", "внешний_вид", "panel_opacity", "float"),
     ("Y_FROM_BOTTOM", "внешний_вид", "y_from_bottom", "int"),
     ("THEM_Y_FROM_TOP", "внешний_вид", "them_y_from_top", "int"),
+    ("ME_X", "внешний_вид", "me_x", "float"),
+    ("THEM_X", "внешний_вид", "them_x", "float"),
     ("MIN_SECONDS", "внешний_вид", "min_seconds", "float"),
     ("RUN_AS_ADMIN", "запуск", "run_as_admin", "bool"),
     ("CHECK_UPDATES", "запуск", "check_updates", "bool"),
@@ -665,6 +672,19 @@ WHISPER_REPOS = {
     "large-v3-turbo": "dropbox-dash/faster-whisper-large-v3-turbo",
     "turbo": "dropbox-dash/faster-whisper-large-v3-turbo",
 }
+
+
+# Модели распознавания на выбор в «Настройках» → «Модели»: (имя, название, описание)
+WHISPER_MODELS = [
+    ("small", "Лёгкая", "~0.5 ГБ · быстрая, для слабых компьютеров и без видеокарты"),
+    ("large-v3-turbo", "Сбалансированная", "~1.6 ГБ · быстрая и точная (рекомендуется)"),
+    ("large-v3", "Максимальная", "~3 ГБ · ещё точнее на шуме и акцентах, но медленнее"),
+]
+
+
+def whisper_downloaded(size):
+    size = "large-v3-turbo" if size == "turbo" else size
+    return os.path.exists(os.path.join(MODELS_DIR, size, "model.bin"))
 
 
 def get_whisper_path(size):
@@ -1565,10 +1585,46 @@ class LayeredOverlay:
     def _draw(self, entries, color):
         sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
         img, m = render_text_image(entries, color, self.win.winfo_fpixels("1p"), int(sw * 0.8))
-        w, h = img.size
+        self.img, self.margin = img, m
+        x, y = self.position(img.size, m)
+        self._blit(img, x, y)
+
+    def x_frac(self):
+        return ME_X if self.anchor[0] is None else THEM_X
+
+    def position(self, size, m):
+        """Где окно с картинкой size: по центру x_frac, по высоте — от верха или от низа."""
+        sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
+        w, h = size
         top, bottom = self.anchor
         y = top - m if top is not None else sh - bottom - h + m
-        self._blit(img, (sw - w) // 2, max(0, min(y, sh - h)))
+        x = int(sw * max(0.0, min(1.0, self.x_frac())) - w / 2)
+        return max(0, min(x, sw - w)), max(0, min(y, sh - h))
+
+    def rect(self):
+        """Плашка с текстом на экране (без полей под тень) — для перетаскивания."""
+        if not self.current or getattr(self, "img", None) is None:
+            return None
+        x, y = self.position(self.img.size, self.margin)
+        w, h = self.img.size
+        m = self.margin
+        return x + m, y + m, x + w - m, y + h - m
+
+    def move_to(self, x, y):
+        """Окно с текущей картинкой — в точку (x, y) без перерисовки (при перетаскивании)."""
+        sw, sh = self.win.winfo_screenwidth(), self.win.winfo_screenheight()
+        w, h = self.img.size
+        x, y = max(0, min(x, sw - w)), max(0, min(y, sh - h))
+        self._blit(self.img, x, y)
+        return x, y
+
+    def set_clickable(self, on):
+        """on=True — окно ловит мышь (режим перетаскивания), иначе клики проходят насквозь."""
+        user32 = ctypes.windll.user32
+        GWL_EXSTYLE, WS_EX_TRANSPARENT = -20, 0x00000020
+        style = user32.GetWindowLongW(self.hwnd, GWL_EXSTYLE)
+        style = style & ~WS_EX_TRANSPARENT if on else style | WS_EX_TRANSPARENT
+        user32.SetWindowLongW(self.hwnd, GWL_EXSTYLE, style)
 
     def _blank(self):
         from PIL import Image
@@ -2120,6 +2176,32 @@ class SettingsWindow:
         self.extra_var.trace_add("write", lambda *_: self._update_targets())
         self._update_targets()
 
+        # --- модели ---
+        box = tab("Модели")
+        ttk.Label(box, text="Распознавание речи", font=("Segoe UI Semibold", 11)
+                  ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        self.whisper_map = {}
+        for key, name, about in WHISPER_MODELS:
+            label = f"{name} — {key}" + ("  ✓" if whisper_downloaded(key) else "")
+            self.whisper_map[label] = (key, about)
+        cur = "large-v3-turbo" if MODEL_SIZE == "turbo" else MODEL_SIZE
+        current = next((k for k, (v, _) in self.whisper_map.items() if v == cur), None)
+        if current is None:  # в settings.ini другая модель (например medium)
+            current = f"{cur} (из settings.ini)"
+            self.whisper_map[current] = (cur, "модель, указанная в settings.ini")
+        self.whisper_var = tk.StringVar(value=current)
+        ttk.Combobox(box, textvariable=self.whisper_var, values=list(self.whisper_map), width=36,
+                     state="readonly").grid(row=1, column=0, columnspan=2, sticky="w", pady=4)
+        self.whisper_about = ttk.Label(box, foreground=UI["muted"])
+        self.whisper_about.grid(row=2, column=0, columnspan=3, sticky="w")
+        self.model_status_label = ttk.Label(box, text="")
+        self.model_status_label.grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        self.whisper_var.trace_add("write", lambda *_: self.show_model_status())
+        self.models_tab_box = box
+        hint(box, "✓ — уже скачана. Новая модель скачается после «Применить» и подключится\n"
+                  "без перезапуска Kat (на это время F9 и перевод собеседников ждут).", 19,
+             pady=(14, 0))
+
         # --- вид ---
         box = tab("Вид")
         ttk.Label(box, text="Прозрачность текста:").grid(row=0, column=0, sticky="w", pady=5)
@@ -2158,9 +2240,11 @@ class SettingsWindow:
             self._num_row(box, r_, *spin)
         foot = ttk.Frame(box)
         foot.grid(row=20, column=0, columnspan=3, sticky="ew", pady=(12, 0))
-        ttk.Label(foot, text="Пример текста показан на экране, пока открыта эта вкладка.",
+        ttk.Label(foot, text="Пример текста — на экране.",
                   foreground=UI["muted"]).pack(side="left")
         ttk.Button(foot, text="Вид по умолчанию", command=self.reset_look).pack(side="right")
+        ttk.Button(foot, text="Передвинуть мышкой", command=self.drag_text
+                   ).pack(side="right", padx=(0, 8))
 
         # --- запуск и о программе ---
         box = tab("Запуск")
@@ -2211,9 +2295,10 @@ class SettingsWindow:
         for var in ([self.opacity, self.panel] + [v for v, *_ in self.nums.values()]
                     + [v for v, _ in self.colors.values()]):
             var.trace_add("write", lambda *_: self.preview())
-        self.view_tab = 3  # пример текста на экране — только на вкладке «Вид»
+        self.view_tab = 4  # пример текста на экране — только на вкладке «Вид»
         nb.bind("<<NotebookTabChanged>>", lambda _e: self._tab_changed())
         self.show_lang_status()
+        self.show_model_status()
 
         win.update_idletasks()
         x = (win.winfo_screenwidth() - win.winfo_width()) // 2
@@ -2253,6 +2338,38 @@ class SettingsWindow:
                                 .get(state, UI["muted"]))
         if state == "error":
             self.lang_retry.pack(side="left", padx=(12, 0))
+
+    def drag_text(self):
+        """Спрятать окно настроек и дать передвинуть субтитры мышкой."""
+        self.win.withdraw()
+
+        def done(saved):
+            if not self.win.winfo_exists():
+                return
+            for k in ("Y_FROM_BOTTOM", "THEM_Y_FROM_TOP"):
+                if k in self.nums:
+                    self.nums[k][0].set(str(globals()[k]))
+                if saved:  # уже сохранено — «Отмена» не должна это откатывать
+                    self.saved_visual[k] = globals()[k]
+            self.win.deiconify()
+            self.win.lift()
+            self.preview()
+        self.app.start_drag(done)
+
+    def show_model_status(self):
+        if not self.win.winfo_exists():
+            return
+        key, about = self.whisper_map.get(self.whisper_var.get(), (MODEL_SIZE, ""))
+        self.whisper_about.config(text=about)
+        if key != ("large-v3-turbo" if MODEL_SIZE == "turbo" else MODEL_SIZE):
+            self.model_status_label.config(
+                text="Нажмите «Применить» — модель " + ("подключится." if whisper_downloaded(key)
+                                                       else "скачается и подключится."),
+                foreground=UI["muted"])
+            return
+        text, state = self.app.model_status()
+        self.model_status_label.config(text=text, foreground={"ready": UI["ok"], "error": UI["err"]}
+                                       .get(state, UI["muted"]))
 
     def retry_language(self):
         self.app.set_extra_language(EXTRA_LANG)
@@ -2433,6 +2550,13 @@ class SettingsWindow:
             extra = EXTRA_LANG  # отказались — язык не меняем
             self.extra_var.set(next(k for k, c in self.lang_map.items() if c == extra))
         target = "en" if not extra or self.target_var.get() == "Английский" else extra
+        whisper = self.whisper_map.get(self.whisper_var.get(), (MODEL_SIZE, ""))[0]
+        if whisper != MODEL_SIZE and not whisper_downloaded(whisper) and not messagebox.askyesno(
+                "Настройки", f"Скачать модель распознавания {whisper}?\n\n"
+                             f"{self.whisper_map[self.whisper_var.get()][1]}. Kat продолжит "
+                             "работать, ход загрузки будет виден на экране.", parent=self.win):
+            whisper = MODEL_SIZE
+        whisper_prev = MODEL_SIZE
         extra_changed = extra != EXTRA_LANG
         mic = self.mic_map[self.mic_var.get()]
         out = self.out_map[self.out_var.get()]
@@ -2463,12 +2587,14 @@ class SettingsWindow:
         values = {**visual, **{k: globals()[k] for k in old_keys},
                   "MIC_DEVICE": mic, "LOOPBACK_DEVICE": out, "RUN_AS_ADMIN": want_admin,
                   "CHECK_UPDATES": self.updates.get(),
-                  "EXTRA_LANG": extra, "TARGET_LANG": target}
+                  "EXTRA_LANG": extra, "TARGET_LANG": target, "MODEL_SIZE": whisper}
         self.show_visual(values)
         self.saved_visual = {k: globals()[k] for k in self.VISUAL}
         app.update_tray()
         if extra_changed:
-            app.set_extra_language(extra)  # в меню трея указана клавиша живого перевода
+            app.set_extra_language(extra)
+        if whisper != whisper_prev:
+            app.switch_whisper(whisper_prev)  # в меню трея указана клавиша живого перевода
         if app.state["loop"] is not None:
             app.state["loop"].set_seconds(THEM_SECONDS)
         try:
@@ -2653,6 +2779,8 @@ class App:
         self.glossary = None  # словарь glossary.txt — общий для всех моделей перевода
         self.update_window = None
         self.lang_state = None  # (код, "loading" | "ready" | "error", текст) — для настроек
+        self.model_state = None  # ("loading" | "error", текст) модели распознавания
+        self.model_desc = ""  # например «GPU, large-v3-turbo»
         self.settings_window = None
         self.tray = None
 
@@ -2721,6 +2849,7 @@ class App:
             except Exception as e:
                 print(f"[!] Не удалось скачать библиотеки CUDA ({e}) — работаю на процессоре.")
             model, desc = load_whisper()
+            self.model_desc = desc
             st["hints"] = Hints(model.hf_tokenizer)
             st["hints"].get(SOURCE_LANG)  # прочитать words.txt и отчитаться в логе
             glossary = Glossary()
@@ -2911,6 +3040,68 @@ class App:
         if code:
             threading.Thread(target=self._install_language, args=(code,),
                              daemon=True, name="language").start()
+
+    def model_status(self):
+        """(текст, состояние) модели распознавания — для вкладки «Модели»."""
+        if self.model_state:
+            return self.model_state[1], self.model_state[0]
+        if self.state["model"] is None:
+            return "Модель загружается...", "loading"
+        return f"Загружена: {self.model_desc} ✓", "ready"
+
+    def _set_model_state(self, state, text):
+        self.model_state = (state, text) if state != "ready" else None
+        if state == "ready":
+            self.model_desc = text
+        w = self.settings_window
+        if w is not None:
+            self.call_in_ui(w.show_model_status)
+
+    def switch_whisper(self, prev_size):
+        """Сменить модель распознавания на MODEL_SIZE (уже записан в настройки) — в фоне."""
+        threading.Thread(target=self._switch_whisper, args=(prev_size,), daemon=True,
+                         name="whisper").start()
+
+    def _switch_whisper(self, prev_size):
+        global _download_hook
+        import gc
+        st = self.state
+        if st["model"] is None:  # модели ещё грузятся — loader возьмёт MODEL_SIZE сам
+            return
+        name = next((n for k, n, _ in WHISPER_MODELS if k == MODEL_SIZE), MODEL_SIZE)
+        self._set_model_state("loading", f"{name}: загружаю...")
+        self.show("me", [(f"Меняю модель распознавания: {name}", "минутку...")])
+
+        def hook(text):
+            pct = re.search(r"(\d+%)", text)
+            self._set_model_state("loading", f"{name}: скачиваю" + (f" — {pct.group(1)}" if pct else "..."))
+            self.show("me", [(f"Скачиваю модель «{name}»", text)])
+        _download_hook = hook
+        with self.model_lock:  # старую — из видеопамяти, иначе две не влезут
+            old, st["model"] = st["model"], None
+        del old
+        gc.collect()
+        try:
+            model, desc = load_whisper()
+            st["hints"] = Hints(model.hf_tokenizer)
+            st["model"] = model
+            print(f"Модель распознавания: {desc}")
+            self._set_model_state("ready", desc)
+            self.show("me", [(f"Модель «{name}» готова ✓", desc)], 4)
+        except Exception as e:
+            traceback.print_exc()
+            set_settings({"MODEL_SIZE": prev_size})
+            try:
+                save_settings({"MODEL_SIZE": prev_size})
+                model, desc = load_whisper()
+                st["hints"] = Hints(model.hf_tokenizer)
+                st["model"] = model
+            except Exception:
+                traceback.print_exc()
+            self._set_model_state("error", f"{name}: не получилось ({e}) — вернул прежнюю")
+            self.show("me", [(f"Модель «{name}» не загрузилась", "Вернул прежнюю. Подробности в log.txt")], 8)
+        finally:
+            _download_hook = None
 
     def lang_status(self):
         """(текст, состояние) дополнительного языка для окна настроек."""
@@ -3275,6 +3466,85 @@ class App:
             old.close()
         return True
 
+    # ---------- передвинуть текст мышкой ----------
+    def start_drag(self, on_done=None):
+        """Субтитры становятся «цепкими»: их можно таскать мышкой. Enter — сохранить,
+        Esc — отменить. on_done(saved) вызывается в конце (окно настроек)."""
+        ov = self.overlays
+        if getattr(self, "drag", None) or not all(hasattr(o, "set_clickable") for o in ov.values()):
+            if on_done:
+                on_done(False)
+            return
+        self.drag = {"on_done": on_done, "grab": None, "was_down": False,
+                     "saved": {k: globals()[k] for k in
+                               ("Y_FROM_BOTTOM", "THEM_Y_FROM_TOP", "ME_X", "THEM_X")}}
+        hint = "Тащите мышкой  ·  Enter — сохранить  ·  Esc — отмена"
+        ov["me"].show([("Мой перевод", hint)], None, TEXT_COLOR)
+        ov["them"].show([("Перевод собеседника", hint)], None, THEM_COLOR)
+        for o in ov.values():
+            o.set_clickable(True)
+        print("[вид] режим перетаскивания текста")
+        self._drag_tick()
+
+    def _drag_tick(self):
+        d = getattr(self, "drag", None)
+        if not d:
+            return
+        user32 = ctypes.windll.user32
+        down = bool(user32.GetAsyncKeyState(0x01) & 0x8000)  # левая кнопка мыши
+        if user32.GetAsyncKeyState(0x0D) & 0x8000:  # Enter
+            return self._finish_drag(True)
+        if user32.GetAsyncKeyState(0x1B) & 0x8000:  # Esc
+            return self._finish_drag(False)
+        pt = _PT()
+        user32.GetCursorPos(ctypes.byref(pt))
+        if down and not d["was_down"]:  # нажали — над какой плашкой?
+            for who, o in self.overlays.items():
+                rc = o.rect()
+                if rc and rc[0] <= pt.x <= rc[2] and rc[1] <= pt.y <= rc[3]:
+                    x, y = o.position(o.img.size, o.margin)
+                    d["grab"] = (who, pt.x - x, pt.y - y)
+                    break
+        elif down and d["grab"]:
+            who, dx, dy = d["grab"]
+            o = self.overlays[who]
+            x, y = o.move_to(pt.x - dx, pt.y - dy)
+            sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+            w, h = o.img.size
+            m = o.margin
+            if who == "me":
+                set_settings({"ME_X": round((x + w / 2) / sw, 4), "Y_FROM_BOTTOM": int(sh - (y + h - m))})
+                o.anchor = (None, Y_FROM_BOTTOM)
+            else:
+                set_settings({"THEM_X": round((x + w / 2) / sw, 4), "THEM_Y_FROM_TOP": int(y + m)})
+                o.anchor = (THEM_Y_FROM_TOP, None)
+        elif not down:
+            d["grab"] = None
+        d["was_down"] = down
+        self.root.after(15, self._drag_tick)
+
+    def _finish_drag(self, save):
+        d, self.drag = self.drag, None
+        ov = self.overlays
+        for o in ov.values():
+            o.set_clickable(False)
+        keys = ("Y_FROM_BOTTOM", "THEM_Y_FROM_TOP", "ME_X", "THEM_X")
+        if save:
+            try:
+                save_settings({k: globals()[k] for k in keys})
+            except OSError as e:
+                print(f"[!] Не удалось сохранить положение текста: {e}")
+            print("[вид] положение текста: " + ", ".join(f"{k}={globals()[k]}" for k in keys))
+        else:
+            set_settings(d["saved"])
+        ov["me"].anchor = (None, Y_FROM_BOTTOM)
+        ov["them"].anchor = (THEM_Y_FROM_TOP, None)
+        ov["me"].show([("Положение сохранено ✓" if save else "Положение не изменилось", None)],
+                      2, STATUS_COLOR)
+        ov["them"].hide()
+        if d["on_done"]:
+            d["on_done"](save)
+
     # ---------- обновления ----------
     @staticmethod
     def remember_version():
@@ -3383,6 +3653,7 @@ class App:
             item(lambda _: f"Живой перевод ({LIVE_HOTKEY.upper()})",
                  lambda: self.call_in_ui(self.toggle_live),
                  checked=lambda _: self.state["live"]),
+            item("Передвинуть текст мышкой", lambda: self.call_in_ui(self.start_drag)),
             item("Пауза", lambda: self.call_in_ui(self.toggle_pause),
                  checked=lambda _: self.state["paused"]),
             item("Перезапустить", lambda: self.call_in_ui(self.restart)),

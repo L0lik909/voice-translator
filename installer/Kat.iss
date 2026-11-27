@@ -7,8 +7,22 @@
   #define AppVersion "0.0.0"
 #endif
 
+; Тестовая сборка (ISCC /DTestBuild ...): своя метка установки и папка — проверка
+; установщика никогда не задевает настоящий установленный Kat.
+#ifdef TestBuild
+  #define MyAppId "{{6F2C7E1A-4B8D-4C1E-9A57-2D3B8E6F4A99}"
+  #define MyName "Kat TEST"
+  #define OutName "KatSetup-test"
+  #define MyDir "KatTest"
+#else
+  #define MyAppId "{{6F2C7E1A-4B8D-4C1E-9A57-2D3B8E6F4A10}"
+  #define MyName "Kat — голосовой переводчик"
+  #define OutName "KatSetup-" + AppVersion
+  #define MyDir "Kat"
+#endif
+
 [Setup]
-AppId={{6F2C7E1A-4B8D-4C1E-9A57-2D3B8E6F4A10}
+AppId={#MyAppId}
 AppName=Kat
 AppVersion={#AppVersion}
 AppVerName=Kat {#AppVersion}
@@ -16,17 +30,17 @@ AppPublisher=L0lik
 AppPublisherURL=https://github.com/L0lik909/voice-translator
 AppSupportURL=https://github.com/L0lik909/voice-translator/issues
 AppUpdatesURL=https://github.com/L0lik909/voice-translator/releases
-DefaultDirName={localappdata}\Programs\Kat
+DefaultDirName={localappdata}\Programs\{#MyDir}
 DisableDirPage=auto
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\dist
-OutputBaseFilename=KatSetup-{#AppVersion}
+OutputBaseFilename={#OutName}
 SetupIconFile=Kat.ico
 UninstallDisplayIcon={app}\Kat.exe
-UninstallDisplayName=Kat — голосовой переводчик
+UninstallDisplayName={#MyName}
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
@@ -73,7 +87,7 @@ Type: files; Name: "{app}\log.txt"
 Type: files; Name: "{app}\log.old.txt"
 Type: files; Name: "{app}\last.wav"
 Type: files; Name: "{app}\icon-*.ico"
-Type: files; Name: "{app}ersion.txt"
+Type: files; Name: "{app}\version.txt"
 Type: files; Name: "{app}\migrate_from.txt"
 Type: dirifempty; Name: "{app}"
 
@@ -81,9 +95,17 @@ Type: dirifempty; Name: "{app}"
 procedure CloseKat();
 var
   Code: Integer;
+  P: String;
 begin
-  { Kat живёт в трее — закрываем его перед заменой файлов }
-  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM Kat.exe', '', SW_HIDE, ewWaitUntilTerminated, Code);
+  { Kat живёт в трее — закрываем его перед заменой файлов. Только ЭТОТ Kat.exe
+    (из папки установки), а не все Kat.exe на компьютере. }
+  P := ExpandConstant('{app}\Kat.exe');
+  StringChangeEx(P, '''', '''''', True);
+  Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+    '-NoProfile -Command "Get-CimInstance Win32_Process -Filter ''Name=''''Kat.exe'''''' | ' +
+    'Where-Object { $_.ExecutablePath -eq ''' + P + ''' } | ' +
+    'ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"',
+    '', SW_HIDE, ewWaitUntilTerminated, Code);
   Sleep(500);
 end;
 
@@ -126,7 +148,7 @@ var
   Code: Integer;
 begin
   { прежняя копия работает как pythonw.exe translator.py — закрываем только её }
-  Exec(ExpandConstant('{sys}\WindowsPowerShell1.0\powershell.exe'),
+  Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
     '-NoProfile -Command "Get-CimInstance Win32_Process -Filter ''Name=''''pythonw.exe'''''' | ' +
     'Where-Object { $_.CommandLine -like ''*translator.py*'' } | ' +
     'ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"',
